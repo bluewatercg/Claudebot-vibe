@@ -10,6 +10,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
@@ -409,8 +410,12 @@ async function buildSystemPrompt(userId, userMessage) {
 
   let prompt = "You are a smart, powerful personal AI assistant with advanced memory.\n\n";
   prompt += "FORMATTING RULES:\n";
-  prompt += "- Never use Markdown symbols like *, _, **, __ in replies\n";
-  prompt += "- Plain text only - dashes for lists, numbers for steps\n";
+  prompt += "- Never use Markdown symbols like *, _, **, __ in regular text replies\n";
+  prompt += "- Plain text only for normal replies - dashes for lists, numbers for steps\n";
+  prompt += "- CODE EXCEPTION: Always wrap ALL code in proper code blocks using triple backticks\n";
+  prompt += "- For code blocks, always specify the language: ```python, ```javascript, ```bash etc\n";
+  prompt += "- When sharing code fixes, always show the COMPLETE fixed code, not just the changed lines\n";
+  prompt += "- When fixing bugs, explain: 1) what was wrong 2) what you changed 3) show full fixed code\n";
   prompt += "- Emojis are fine\n";
   prompt += "- Short questions = concise replies\n";
   prompt += "- Detailed tasks = full complete replies without stopping\n";
@@ -543,6 +548,86 @@ bot.help(function(ctx) {
   );
 });
 
+
+// ── Vibe Coding ───────────────────────────────────────────────────────────────
+const vibeSessions = new Map();
+
+async function getGitHubUser() {
+  const res = await fetch("https://api.github.com/user", {
+    headers: { "Authorization": "token " + GITHUB_TOKEN, "User-Agent": "ClaudeBot" }
+  });
+  return await res.json();
+}
+
+async function createGitHubRepo(repoName, description) {
+  const res = await fetch("https://api.github.com/user/repos", {
+    method: "POST",
+    headers: { "Authorization": "token " + GITHUB_TOKEN, "Content-Type": "application/json", "User-Agent": "ClaudeBot" },
+    body: JSON.stringify({ name: repoName, description: description || "Created by Claude Bot", private: false, auto_init: false })
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.message || "Failed to create repo");
+  return data;
+}
+
+async function pushFilesToGitHub(owner, repoName, files) {
+  const headers = { "Authorization": "token " + GITHUB_TOKEN, "Content-Type": "application/json", "User-Agent": "ClaudeBot" };
+  const base = "https://api.github.com/repos/" + owner + "/" + repoName;
+  let treeSha, commitSha;
+
+  const branchRes = await fetch(base + "/git/ref/heads/main", { headers });
+  if (branchRes.ok) {
+    const bd = await branchRes.json();
+    commitSha = bd.object.sha;
+    const cd = await (await fetch(base + "/git/commits/" + commitSha, { headers })).json();
+    treeSha = cd.tree.sha;
+  }
+
+  const treeItems = [];
+  for (const [path, fileContent] of Object.entries(files)) {
+    const blob = await (await fetch(base + "/git/blobs", {
+      method: "POST", headers,
+      body: JSON.stringify({ content: fileContent, encoding: "utf-8" })
+    })).json();
+    treeItems.push({ path, mode: "100644", type: "blob", sha: blob.sha });
+  }
+
+  const treeBody = { tree: treeItems };
+  if (treeSha) treeBody.base_tree = treeSha;
+  const tree = await (await fetch(base + "/git/trees", { method: "POST", headers, body: JSON.stringify(treeBody) })).json();
+
+  const commitBody = { message: "Initial commit by Claude Bot", tree: tree.sha };
+  if (commitSha) commitBody.parents = [commitSha];
+  const newCommit = await (await fetch(base + "/git/commits", { method: "POST", headers, body: JSON.stringify(commitBody) })).json();
+
+  if (branchRes.ok) {
+    await fetch(base + "/git/refs/heads/main", { method: "PATCH", headers, body: JSON.stringify({ sha: newCommit.sha, force: true }) });
+  } else {
+    await fetch(base + "/git/refs", { method: "POST", headers, body: JSON.stringify({ ref: "refs/heads/main", sha: newCommit.sha }) });
+  }
+  return "https://github.com/" + owner + "/" + repoName;
+}
+
+async function generateProjectFiles(idea, techStack, details) {
+  const prompt = "You are an expert developer. Generate a complete, production-ready project.\n\nPROJECT IDEA: " + idea + "\nTECH STACK: " + techStack + "\nADDITIONAL DETAILS: " + (details || "none") + "\n\nReturn a JSON object where keys are file paths and values are file contents. Include ALL necessary files: main code, package.json or requirements.txt, README.md, .gitignore, and config files. Make the code complete and runnable - no placeholders.\n\nReturn ONLY valid JSON, no explanation, no markdown backticks.";
+  const res = await anthropic.messages.create({ model: "claude-opus-4-5", max_tokens: 4096, messages: [{ role: "user", content: prompt }] });
+  const text = (res.content[0] || {}).text || "{}";
+  const clean = text.replace(/^```json\n?|^```\n?|```$/gm, "").trim();
+  return JSON.parse(clean);
+}
+
+bot.command("vibe", async function(ctx) {
+  if (!GITHUB_TOKEN) return ctx.reply("Vibe coding 未启用。请在 Railway 添加 GITHUB_TOKEN 环境变量。");
+  const userId = ctx.from.id;
+  vibeSessions.set(userId, { step: "idea" });
+  await ctx.reply("🚀 Vibe Coding 模式启动！\n\n说说你想做什么？（一句话描述你的项目想法）");
+});
+
+bot.command("vibestop", async function(ctx) {
+  vibeSessions.delete(ctx.from.id);
+  await ctx.reply("已退出 Vibe Coding 模式。");
+});
+
 bot.command("memory", async function(ctx) {
   await ctx.sendChatAction("typing");
   const docs = await getAllDocs(ctx.from.id);
@@ -659,6 +744,59 @@ bot.command("reset", async function(ctx) {
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
   const userMessage = ctx.message.text;
+
+  // Handle vibe coding session
+  if (vibeSessions.has(userId) && !userMessage.startsWith("/")) {
+    const session = vibeSessions.get(userId);
+
+    if (session.step === "idea") {
+      session.idea = userMessage;
+      session.step = "stack";
+      vibeSessions.set(userId, session);
+      return ctx.reply("💡 好的！用什么技术栈？\n\n例如：Node.js, Python, React, Next.js 等\n（不确定就说 '帮我选'）");
+    }
+
+    if (session.step === "stack") {
+      let stack = userMessage;
+      if (userMessage.toLowerCase().includes("帮我选") || userMessage.toLowerCase().includes("你选")) {
+        stack = "Node.js + Express";
+      }
+      session.stack = stack;
+      session.step = "details";
+      vibeSessions.set(userId, session);
+      return ctx.reply("📝 还有什么额外要求？\n\n例如：需要数据库、特定 API、特殊功能\n（没有就发 '没有'）");
+    }
+
+    if (session.step === "details") {
+      session.details = userMessage;
+      session.step = "building";
+      vibeSessions.set(userId, session);
+      await ctx.reply("⚙️ 开始生成项目...请稍等 30-60 秒");
+      await ctx.sendChatAction("typing");
+
+      try {
+        const files = await generateProjectFiles(session.idea, session.stack, session.details);
+        const fileCount = Object.keys(files).length;
+        await ctx.reply("✅ 生成了 " + fileCount + " 个文件，推送到 GitHub 中...");
+
+        const ghUser = await getGitHubUser();
+        const owner = ghUser.login;
+        const repoName = session.idea.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim().split(/\s+/).slice(0, 4).join("-") + "-" + Date.now().toString().slice(-4);
+
+        await createGitHubRepo(repoName, session.idea);
+        const repoUrl = await pushFilesToGitHub(owner, repoName, files);
+        vibeSessions.delete(userId);
+
+        const fileList = Object.keys(files).map(function(f) { return "- " + f; }).join("\n");
+        await ctx.reply("🎉 项目已推送！\n\n📦 GitHub: " + repoUrl + "\n\n文件列表:\n" + fileList + "\n\n下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 自动部署完成 ✅");
+      } catch (err) {
+        console.error("Vibe error:", err.message);
+        vibeSessions.delete(userId);
+        await ctx.reply("生成失败: " + err.message + "\n\n请重新发 /vibe 再试。");
+      }
+      return;
+    }
+  }
 
   // Auto-summarize if message too long
   let processedMessage = userMessage;
