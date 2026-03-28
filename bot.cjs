@@ -11,6 +11,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
@@ -40,6 +41,23 @@ const docsStore = new Map();
 const summaryStore = new Map();
 const vectorStore = new Map();
 const processingLock = new Map(); // prevent concurrent processing per user
+const docsCache = new Map(); // cache docs for 60 seconds
+const CACHE_TTL = 60000;
+
+function getCachedDoc(userId, docType) {
+  const key = userId + "_" + docType;
+  const cached = docsCache.get(key);
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached.value;
+  return null;
+}
+
+function setCachedDoc(userId, docType, value) {
+  docsCache.set(userId + "_" + docType, { value, ts: Date.now() });
+}
+
+function invalidateDocCache(userId, docType) {
+  docsCache.delete(userId + "_" + docType);
+}
 
 async function withLock(userId, fn) {
   if (processingLock.get(userId)) {
@@ -117,26 +135,20 @@ async function clearHistory(userId) {
 
 // ── .md 文件操作 ──────────────────────────────────────────────────────────────
 async function getDoc(userId, docType) {
+  const cached = getCachedDoc(userId, docType);
+  if (cached !== null) return cached;
   if (supabase) {
     try {
       const uid = parseInt(userId);
-      console.log("getDoc querying - userId:", uid, "type:", typeof uid, "docType:", docType);
-      const { data, error, count } = await supabase
+      const { data, error } = await supabase
         .from("user_docs")
         .select("content", { count: "exact" })
         .eq("user_id", uid)
         .eq("doc_type", docType);
-      console.log("getDoc raw result - error:", error ? error.message : "none", "data length:", data ? data.length : 0, "count:", count);
-      if (error) {
-        console.error("getDoc error:", docType, error.message);
-        return null;
-      }
-      if (data && data.length > 0) {
-        console.log("getDoc FOUND:", docType, data[0].content.substring(0, 50));
-        return data[0].content;
-      }
-      console.log("getDoc NOT FOUND:", docType);
-      return null;
+      if (error) { console.error("getDoc error:", docType, error.message); return null; }
+      const value = (data && data.length > 0) ? data[0].content : null;
+      setCachedDoc(userId, docType, value);
+      return value;
     } catch (err) {
       console.error("getDoc exception:", err.message);
       return null;
@@ -157,6 +169,7 @@ async function setDoc(userId, docType, content) {
         console.error("setDoc upsert error:", JSON.stringify(result.error));
       } else {
         console.log("setDoc SUCCESS - userId:", userId, "docType:", docType);
+      invalidateDocCache(userId, docType);
       }
       return;
     } catch (err) { console.error("setDoc exception:", err.message); }
@@ -293,6 +306,16 @@ async function searchMemories(userId, query) {
 
 // ── 自动学习 ──────────────────────────────────────────────────────────────────
 async function autoLearnMemory(userId, userMessage, aiReply) {
+  // Quick check: is this conversation worth learning from?
+  try {
+    const worthCheck = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 5,
+      messages: [{ role: "user", content: "Does this conversation contain new facts, preferences, projects or decisions worth remembering long-term? Answer YES or NO only.\n\nUser: " + userMessage.substring(0, 200) + "\nAssistant: " + aiReply.substring(0, 200) }]
+    });
+    const worth = (worthCheck.content[0] || {}).text || "NO";
+    if (!worth.toUpperCase().includes("YES")) return;
+  } catch (e) { return; }
   try {
     const docs = await getAllDocs(userId);
     const currentDocs = JSON.stringify(docs, null, 2);
@@ -383,6 +406,10 @@ async function tavilySearch(query) {
 // 用 Claude 智能判断是否需要搜索
 async function needsSearch(message) {
   if (!TAVILY_API_KEY) return false;
+  // Skip search for very short messages
+  if (message.length < 15) return false;
+  // Skip search for pure code/debug messages
+  if (message.startsWith("```") || message.includes("error:") && message.length < 50) return false;
   try {
     const response = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
@@ -393,7 +420,6 @@ async function needsSearch(message) {
       }]
     });
     const answer = response.content[0] ? response.content[0].text.trim().toUpperCase() : "NO";
-    console.log("needsSearch:", answer, "for:", message.substring(0, 50));
     return answer.includes("YES");
   } catch (err) {
     return false;
@@ -420,7 +446,9 @@ async function buildSystemPrompt(userId, userMessage) {
   prompt += "- Short questions = concise replies\n";
   prompt += "- Detailed tasks = full complete replies without stopping\n";
   prompt += "- Always reply in the same language the user wrote in\n";
-  prompt += "- Never stop mid-reply\n\n";
+  prompt += "- Never stop mid-reply\n";
+  prompt += "- For code: ALWAYS write the complete code in ONE reply, never split across messages\n";
+  prompt += "- If code is long, still write it all - it will be sent as a file automatically\n\n";
 
   if (docs.soul) prompt += "=== WHO THE USER IS ===\n" + docs.soul + "\n\n";
   if (docs.projects) prompt += "=== USER PROJECTS ===\n" + docs.projects + "\n\n";
@@ -443,7 +471,7 @@ async function buildSystemPrompt(userId, userMessage) {
 }
 
 // ── Claude 主函数（不用 tools，直接搜索）─────────────────────────────────────
-async function askClaude(userId, userMessage) {
+async function askClaude(userId, userMessage, ctx) {
   await saveMessage(userId, "user", userMessage);
 
   const [systemPrompt, history] = await Promise.all([
@@ -452,41 +480,65 @@ async function askClaude(userId, userMessage) {
   ]);
 
   let messages = history.length > 0 ? [...history] : [{ role: "user", content: userMessage }];
+  let activeSystemPrompt = systemPrompt;
 
   // 如果需要搜索，先搜索再把结果加进对话
   if ((await needsSearch(userMessage)) && TAVILY_API_KEY) {
     const searchResults = await tavilySearch(userMessage);
     if (searchResults) {
-      // 把搜索结果加进 system prompt
-      const enhancedPrompt = systemPrompt + "=== WEB SEARCH RESULTS ===\nToday is 2026. IMPORTANT: Base your answer primarily on these search results, not your training data. If results show current info, use it.\n" + searchResults + "\n\n";
-      const response = await anthropic.messages.create({
-        model: "claude-opus-4-5",
-        max_tokens: 4096,
-        system: enhancedPrompt,
-        messages: messages
-      });
-      const reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
-      await saveMessage(userId, "assistant", reply);
-      countMessages(userId).then(function(count) {
-        const tasks = [maybeAutoSummarize(userId)];
-        if (count % 5 === 0) tasks.push(autoLearnMemory(userId, userMessage, reply));
-        return Promise.all(tasks);
-      }).catch(function(err) { console.error("Background error:", err.message); });
-      return reply;
+      activeSystemPrompt = systemPrompt + "=== WEB SEARCH RESULTS ===\nToday is 2026. IMPORTANT: Base your answer primarily on these search results, not your training data. If results show current info, use it.\n" + searchResults + "\n\n";
     }
   }
 
-  // 普通对话（不用搜索）
-  const response = await anthropic.messages.create({
-    model: "claude-opus-4-5",
-    max_tokens: 4096,
-    system: systemPrompt,
-    messages: messages
-  });
+  // Streaming response
+  let reply = "";
+  let sentMsg = null;
+  let lastUpdate = 0;
+  const UPDATE_INTERVAL = 1500; // update every 1.5 seconds
 
-  const reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "Sorry, I could not generate a reply.";
+  try {
+    const stream = anthropic.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 8192,
+      system: activeSystemPrompt,
+      messages: messages
+    });
+
+    // Send initial placeholder
+    if (ctx) sentMsg = await ctx.reply("...");
+
+    for await (const event of stream) {
+      if (event.type === "content_block_delta" && event.delta && event.delta.type === "text_delta") {
+        reply += event.delta.text;
+        const now = Date.now();
+        if (ctx && sentMsg && now - lastUpdate > UPDATE_INTERVAL && reply.length > 10) {
+          try {
+            await ctx.telegram.editMessageText(ctx.chat.id, sentMsg.message_id, null, reply.substring(0, 4000) + (reply.length > 4000 ? "..." : ""));
+            lastUpdate = now;
+          } catch (e) { /* ignore edit errors */ }
+        }
+      }
+    }
+
+    // Final update or send full response
+    if (ctx && sentMsg) {
+      try {
+        await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
+      } catch (e) { /* ignore */ }
+    }
+  } catch (err) {
+    console.error("Stream error:", err.message);
+    // Fallback to non-streaming
+    if (!reply) {
+      const response = await anthropic.messages.create({
+        model: "claude-opus-4-5", max_tokens: 8192,
+        system: activeSystemPrompt, messages: messages
+      });
+      reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "出错了，请再试一次。";
+    }
+  }
+
   await saveMessage(userId, "assistant", reply);
-
   countMessages(userId).then(function(count) {
     const tasks = [maybeAutoSummarize(userId)];
     if (count % 5 === 0) tasks.push(autoLearnMemory(userId, userMessage, reply));
@@ -501,61 +553,36 @@ async function sendLongMessage(ctx, text) {
   const MAX = 3800;
   if (text.length <= MAX) { await ctx.reply(text); return; }
 
+  // If response contains code and is very long, send as file
+  const hasCode = text.includes("```");
+  if (hasCode && text.length > MAX) {
+    // Send a short summary first
+    const lines = text.split("\n");
+    const summary = lines.slice(0, 8).join("\n") + "\n\n[代码太长，以文件形式发送 👇]";
+    await ctx.reply(summary);
+
+    // Send as .txt file
+    const buf = Buffer.from(text, "utf-8");
+    const ts = new Date().toISOString().slice(11,16).replace(":","");
+    await ctx.replyWithDocument({ source: buf, filename: "code_" + ts + ".txt" }, { caption: "完整代码（直接复制粘贴）" });
+    return;
+  }
+
+  // For long non-code text, split by paragraph
   const chunks = [];
   let remaining = text;
-
   while (remaining.length > 0) {
-    if (remaining.length <= MAX) {
-      chunks.push(remaining);
-      break;
-    }
-
-    // Count open code blocks to avoid splitting inside one
-    const slice = remaining.substring(0, MAX);
-    const codeBlockCount = (slice.match(/```/g) || []).length;
-    const insideCodeBlock = codeBlockCount % 2 !== 0;
-
-    let splitAt = -1;
-
-    if (insideCodeBlock) {
-      // Find the last closing ``` before MAX
-      const lastClose = slice.lastIndexOf("```");
-      if (lastClose > 100) {
-        splitAt = lastClose + 3; // include the closing ```
-      }
-    }
-
-    // Fall back to last newline before MAX
-    if (splitAt === -1) {
-      splitAt = remaining.lastIndexOf("\n", MAX);
-    }
-    if (splitAt === -1 || splitAt < 100) {
-      splitAt = MAX;
-    }
-
-    let chunk = remaining.substring(0, splitAt).trim();
-
-    // If we cut inside a code block, close it
-    const openBlocks = (chunk.match(/```/g) || []).length;
-    if (openBlocks % 2 !== 0) {
-      chunk += "\n```";
-    }
-
-    chunks.push(chunk);
+    if (remaining.length <= MAX) { chunks.push(remaining); break; }
+    let splitAt = remaining.lastIndexOf("\n\n", MAX);
+    if (splitAt === -1) splitAt = remaining.lastIndexOf("\n", MAX);
+    if (splitAt === -1 || splitAt < 100) splitAt = MAX;
+    chunks.push(remaining.substring(0, splitAt).trim());
     remaining = remaining.substring(splitAt).trim();
-
-    // If next chunk starts mid-code-block, reopen it
-    if (openBlocks % 2 !== 0 && remaining.length > 0) {
-      remaining = "```\n" + remaining;
-    }
   }
 
   for (let i = 0; i < chunks.length; i++) {
-    if (chunks.length > 1) {
-      await ctx.reply(chunks[i] + (i < chunks.length - 1 ? "\n\n[" + (i + 1) + "/" + chunks.length + "]" : ""));
-    } else {
-      await ctx.reply(chunks[i]);
-    }
+    const suffix = chunks.length > 1 && i < chunks.length - 1 ? "\n\n[" + (i+1) + "/" + chunks.length + "]" : "";
+    await ctx.reply(chunks[i] + suffix);
     if (i < chunks.length - 1) await new Promise(function(r) { setTimeout(r, 300); });
   }
 }
@@ -598,6 +625,82 @@ bot.help(function(ctx) {
   );
 });
 
+
+
+// ── Railway 自动部署 ───────────────────────────────────────────────────────────
+async function railwayDeploy(repoUrl, projectName, envVars) {
+  const headers = {
+    "Authorization": "Bearer " + RAILWAY_API_TOKEN,
+    "Content-Type": "application/json"
+  };
+
+  // Step 1: Create project
+  const createProjectRes = await fetch("https://backboard.railway.app/graphql/v2", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query: `mutation { projectCreate(input: { name: "${projectName}" }) { id name } }`
+    })
+  });
+  const projectData = await createProjectRes.json();
+  const projectId = projectData.data && projectData.data.projectCreate && projectData.data.projectCreate.id;
+  if (!projectId) throw new Error("Failed to create Railway project: " + JSON.stringify(projectData));
+
+  // Step 2: Create service from GitHub repo
+  const repoPath = repoUrl.replace("https://github.com/", "");
+  const createServiceRes = await fetch("https://backboard.railway.app/graphql/v2", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query: `mutation { serviceCreate(input: { projectId: "${projectId}", name: "${projectName}", source: { repo: "${repoPath}" } }) { id name } }`
+    })
+  });
+  const serviceData = await createServiceRes.json();
+  const serviceId = serviceData.data && serviceData.data.serviceCreate && serviceData.data.serviceCreate.id;
+  if (!serviceId) throw new Error("Failed to create Railway service: " + JSON.stringify(serviceData));
+
+  // Step 3: Get environment ID
+  const envRes = await fetch("https://backboard.railway.app/graphql/v2", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query: `query { project(id: "${projectId}") { environments { edges { node { id name } } } } }`
+    })
+  });
+  const envData = await envRes.json();
+  const envId = envData.data && envData.data.project && envData.data.project.environments &&
+    envData.data.project.environments.edges[0] && envData.data.project.environments.edges[0].node.id;
+
+  // Step 4: Set environment variables if provided
+  if (envVars && envId) {
+    for (const [key, value] of Object.entries(envVars)) {
+      await fetch("https://backboard.railway.app/graphql/v2", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          query: `mutation { variableUpsert(input: { projectId: "${projectId}", environmentId: "${envId}", serviceId: "${serviceId}", name: "${key}", value: "${value}" }) }`
+        })
+      });
+    }
+  }
+
+  // Step 5: Generate domain
+  const domainRes = await fetch("https://backboard.railway.app/graphql/v2", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      query: `mutation { serviceDomainCreate(input: { serviceId: "${serviceId}", environmentId: "${envId}" }) { domain } }`
+    })
+  });
+  const domainData = await domainRes.json();
+  const domain = domainData.data && domainData.data.serviceDomainCreate && domainData.data.serviceDomainCreate.domain;
+
+  return {
+    projectId,
+    serviceId,
+    url: domain ? "https://" + domain : "https://railway.app/project/" + projectId
+  };
+}
 
 // ── Vibe Coding ───────────────────────────────────────────────────────────────
 const vibeSessions = new Map();
@@ -664,6 +767,30 @@ async function generateProjectFiles(idea, techStack, details) {
   const text = (res.content[0] || {}).text || "{}";
   const clean = text.replace(/^```json\n?|^```\n?|```$/gm, "").trim();
   return JSON.parse(clean);
+}
+
+async function reviewAndFixFiles(files, idea, techStack) {
+  const filesSummary = Object.entries(files).map(function(entry) {
+    const path = entry[0];
+    const code = entry[1];
+    return "=== " + path + " ===\n" + code.substring(0, 1500) + (code.length > 1500 ? "\n...[truncated]" : "");
+  }).join("\n\n");
+
+  const reviewPrompt = "You are a senior developer reviewing code before deployment.\n\nProject idea: " + idea + "\nTech stack: " + techStack + "\n\nGenerated files:\n" + filesSummary + "\n\nReview the code and fix any issues:\n1. Syntax errors or typos\n2. Missing imports or dependencies\n3. Broken logic or incomplete functions\n4. Security issues (hardcoded secrets, etc)\n5. Missing error handling\n\nReturn ONLY a JSON object with the fixed files (same structure: filepath -> content). If a file is fine, include it unchanged. Return ONLY valid JSON, no explanation.";
+
+  const res = await anthropic.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8192,
+    messages: [{ role: "user", content: reviewPrompt }]
+  });
+  const text = (res.content[0] || {}).text || "{}";
+  const clean = text.replace(/^```json\n?|^```\n?|```$/gm, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch (e) {
+    console.error("Review parse error:", e.message);
+    return files; // return original if review fails
+  }
 }
 
 bot.command("vibe", async function(ctx) {
@@ -791,6 +918,38 @@ bot.command("reset", async function(ctx) {
 });
 
 // ── 处理文字消息 ──────────────────────────────────────────────────────────────
+
+bot.command("deploy", async function(ctx) {
+  if (!RAILWAY_API_TOKEN) return ctx.reply("Railway 部署未启用。请在 Railway Variables 添加 RAILWAY_API_TOKEN。");
+  if (!GITHUB_TOKEN) return ctx.reply("需要 GITHUB_TOKEN 才能部署。");
+
+  const args = ctx.message.text.split(" ").slice(1);
+  const repoUrl = args[0];
+
+  if (!repoUrl || !repoUrl.includes("github.com")) {
+    return ctx.reply("用法：/deploy https://github.com/user/repo\n\n可以加环境变量：\n/deploy https://github.com/user/repo KEY1=val1 KEY2=val2");
+  }
+
+  const envVars = {};
+  args.slice(1).forEach(function(arg) {
+    const [key, ...rest] = arg.split("=");
+    if (key && rest.length) envVars[key] = rest.join("=");
+  });
+
+  const projectName = repoUrl.split("/").pop().substring(0, 30);
+  await ctx.reply("🚀 开始部署 " + projectName + "...\n\n[1/3] 创建 Railway 项目");
+  await ctx.sendChatAction("typing");
+
+  try {
+    await ctx.reply("[2/3] 连接 GitHub repo，配置环境变量...");
+    const result = await railwayDeploy(repoUrl, projectName, envVars);
+    await ctx.reply("✅ 部署完成！\n\n🌐 URL: " + result.url + "\n📦 项目: https://railway.app/project/" + result.projectId + "\n\n几分钟后即可访问。");
+  } catch (err) {
+    console.error("Deploy error:", err.message);
+    await ctx.reply("部署失败: " + err.message);
+  }
+});
+
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
   const userMessage = ctx.message.text;
@@ -825,26 +984,84 @@ bot.on("text", async function(ctx) {
       await ctx.sendChatAction("typing");
 
       try {
+        // Step 1: Generate
+        await ctx.reply("⚙️ [1/3] 生成代码中...");
         const files = await generateProjectFiles(session.idea, session.stack, session.details);
         const fileCount = Object.keys(files).length;
-        await ctx.reply("✅ 生成了 " + fileCount + " 个文件，推送到 GitHub 中...");
+        await ctx.reply("✅ 生成了 " + fileCount + " 个文件");
 
+        // Step 2: Review + Fix
+        await ctx.reply("🔍 [2/3] 代码审查中，修复潜在问题...");
+        await ctx.sendChatAction("typing");
+        const reviewedFiles = await reviewAndFixFiles(files, session.idea, session.stack);
+        const reviewedCount = Object.keys(reviewedFiles).length;
+        await ctx.reply("✅ 审查完成，共 " + reviewedCount + " 个文件准备就绪");
+
+        // Step 3: Push to GitHub
+        await ctx.reply("📦 [3/3] 推送到 GitHub 中...");
         const ghUser = await getGitHubUser();
         const owner = ghUser.login;
         const repoName = session.idea.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim().split(/\s+/).slice(0, 4).join("-") + "-" + Date.now().toString().slice(-4);
 
         await createGitHubRepo(repoName, session.idea);
-        const repoUrl = await pushFilesToGitHub(owner, repoName, files);
+        const repoUrl = await pushFilesToGitHub(owner, repoName, reviewedFiles);
         vibeSessions.delete(userId);
 
-        const fileList = Object.keys(files).map(function(f) { return "- " + f; }).join("\n");
-        await ctx.reply("🎉 项目已推送！\n\n📦 GitHub: " + repoUrl + "\n\n文件列表:\n" + fileList + "\n\n下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 自动部署完成 ✅");
+        const fileList = Object.keys(reviewedFiles).map(function(f) { return "- " + f; }).join("\n");
+        await ctx.reply("🎉 完成！\n\n📦 GitHub: " + repoUrl + "\n\n文件:\n" + fileList + "\n\n下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 部署完成 ✅");
       } catch (err) {
         console.error("Vibe error:", err.message);
         vibeSessions.delete(userId);
         await ctx.reply("生成失败: " + err.message + "\n\n请重新发 /vibe 再试。");
       }
       return;
+    }
+  }
+
+  // Auto-fetch and summarize URLs
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const urls = userMessage.match(urlRegex);
+  const isJustUrl = urls && urls.length === 1 && userMessage.trim() === urls[0];
+  const hasUrlWithNoContext = urls && urls.length >= 1 && userMessage.trim().length < 120;
+
+  if (urls && (isJustUrl || hasUrlWithNoContext)) {
+    await ctx.sendChatAction("typing");
+    try {
+      let url = urls[0];
+      // Auto-convert GitHub blob URLs to raw
+      if (url.includes("github.com") && url.includes("/blob/")) {
+        url = url
+          .replace("github.com", "raw.githubusercontent.com")
+          .replace("/blob/", "/");
+        console.log("Converted to raw GitHub URL:", url);
+      }
+      const fetchRes = await fetch(url, {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; ClaudeBot/1.0)" },
+        signal: AbortSignal.timeout(8000)
+      });
+      const html = await fetchRes.text();
+      // Strip HTML tags
+      const text = html
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .substring(0, 6000);
+
+      if (text.length > 200) {
+        const instruction = isJustUrl
+          ? "总结这个网页的主要内容，提取关键信息。"
+          : userMessage.replace(url, "").trim() || "总结这个网页的主要内容。";
+        const result = await withLock(userId, async function() {
+          return await askClaude(userId, "网页链接: " + url + "\n\n网页内容:\n" + text + "\n\n" + instruction, ctx);
+        });
+        if (result) await sendLongMessage(ctx, result);
+        return;
+      }
+    } catch (err) {
+      console.error("URL fetch error:", err.message);
+      // Fall through to normal processing if fetch fails
     }
   }
 
@@ -873,7 +1090,7 @@ bot.on("text", async function(ctx) {
   await ctx.sendChatAction("typing");
   try {
     const result = await withLock(userId, async function() {
-      return await askClaude(userId, processedMessage);
+      return await askClaude(userId, processedMessage, ctx);
     });
     if (result) {
       await sendLongMessage(ctx, result);
@@ -881,7 +1098,7 @@ bot.on("text", async function(ctx) {
     // if null, silently drop duplicate request
   } catch (err) {
     console.error("Claude error:", err.message);
-    await ctx.reply("Something went wrong. Please try again.");
+    await ctx.reply("出错了，请稍后再试。");
   }
 });
 
@@ -920,7 +1137,7 @@ bot.on("photo", async function(ctx) {
     await sendLongMessage(ctx, reply);
   } catch (err) {
     console.error("Image error:", err.message);
-    await ctx.reply("Something went wrong processing your image.");
+    await ctx.reply("图片处理失败，请重新发送。");
   }
 });
 
