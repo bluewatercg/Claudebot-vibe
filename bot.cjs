@@ -12,6 +12,7 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MAIN_MODEL = process.env.AI_MODEL || "claude-opus-4-5";
 const FAST_MODEL = process.env.AI_FAST_MODEL || "claude-haiku-4-5-20251001";
 const PORT = process.env.PORT || 3000;
@@ -1081,18 +1082,31 @@ bot.command("code", async function(ctx) {
 
 // Store pending fix tasks (file content + instructions)
 const pendingFix = new Map();
+// Auto-expire pendingFix after 10 minutes
+setInterval(function() {
+  const now = Date.now();
+  pendingFix.forEach(function(val, key) {
+    if (val.createdAt && now - val.createdAt > 10 * 60 * 1000) {
+      pendingFix.delete(key);
+      console.log("pendingFix expired for user:", key);
+    }
+  });
+}, 60000);
 
 bot.command("fix", async function(ctx) {
   const userId = ctx.from.id;
-  const instructions = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  const firstLine = ctx.message.text.split("\n")[0];
+  const instructions = firstLine.split(" ").slice(1).join(" ").trim();
   
   if (!instructions) {
-    pendingFix.set(userId, { waiting: true, instructions: null });
-    return ctx.reply("🔧 Fix 模式\n\n先告诉我要修什么？\n（然后发 .py 文件给我）");
+    // No instructions yet - wait for user to type them, NOT ready for file
+    pendingFix.set(userId, { waiting: false, instructions: null, createdAt: Date.now() });
+    return ctx.reply("🔧 Fix 模式\n\n要修什么？（直接打说明）");
   }
   
-  pendingFix.set(userId, { waiting: true, instructions });
-  await ctx.reply("🔧 Fix 模式\n\n任务：" + instructions + "\n\n现在发 .py 文件给我 👇");
+  // Has instructions - now ready for file
+  pendingFix.set(userId, { waiting: true, instructions, createdAt: Date.now() });
+  await ctx.reply("🔧 Fix 模式 — " + instructions + "\n\n发 .py 文件给我 👇");
 });
 
 
@@ -1118,7 +1132,7 @@ async function autoAnalyzeAndFix(ctx, userId, fileName, fileText) {
 
       // Step 2: Ask if they want fixes
       await ctx.reply("要我生成修复版吗？\n\n直接回复 '修复' 或告诉我要修哪些问题");
-      pendingFix.set(userId, { waiting: true, instructions: "__auto__", originalCode: fileText, fileName });
+      pendingFix.set(userId, { waiting: true, instructions: "__auto__", originalCode: fileText, fileName, createdAt: Date.now() });
 
     } catch (err) {
       console.error("Auto analyze error:", err.message);
@@ -1137,13 +1151,29 @@ async function processFileFix(ctx, userId, fileName, fileText, instructions) {
       let fullCode = "";
       
       if (fileText.length <= CHUNK) {
-        // Small file - fix in one shot
-        const res = await anthropic.messages.create({
-          model: MAIN_MODEL, max_tokens: 8192,
-          system: "You are an expert Python programmer. Fix/modify the code as instructed. Output ONLY the complete modified Python code, no explanations, no markdown backticks.",
-          messages: [{ role: "user", content: "File: " + fileName + "\n\nInstructions: " + instructions + "\n\nOriginal code:\n" + fileText + "\n\nOutput the complete modified code:" }]
+        // 2-pass output to avoid truncation
+        const sysPrompt = "You are an expert Python programmer. Fix/modify code as instructed. Output ONLY Python code, no explanations, no markdown.";
+        const userMsg = "File: " + fileName + "\n\nInstructions: " + instructions + "\n\nOriginal code:\n" + fileText;
+
+        const res1 = await anthropic.messages.create({
+          model: MAIN_MODEL, max_tokens: 8192, system: sysPrompt,
+          messages: [{ role: "user", content: userMsg + "\n\nOutput the FIRST HALF of the complete modified code. End with comment: # === PART 2 CONTINUES ===" }]
         });
-        fullCode = (res.content[0] || {}).text || "";
+        const part1 = ((res1.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
+
+        await ctx.reply("⚙️ 生成后半部分...");
+        await ctx.sendChatAction("typing");
+
+        const res2 = await anthropic.messages.create({
+          model: MAIN_MODEL, max_tokens: 8192, system: sysPrompt,
+          messages: [
+            { role: "user", content: userMsg },
+            { role: "assistant", content: part1 },
+            { role: "user", content: "Continue and output the SECOND HALF of the modified code. Start from where you left off." }
+          ]
+        });
+        const part2 = ((res2.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
+        fullCode = part1 + "\n" + part2;
       } else {
         // Large file - process in chunks, then merge
         const chunks = [];
@@ -1182,10 +1212,12 @@ async function processFileFix(ctx, userId, fileName, fileText, instructions) {
       const ts = new Date().toISOString().slice(11,16).replace(":","");
       const outName = fileName.replace(".py", "_fixed_" + ts + ".py");
       
-      await ctx.replyWithDocument(
-        { source: buf, filename: outName },
-        { caption: "✅ 修改完成！\n\n用 /save [版本名] 保存" }
-      );
+      await withRetry(function() {
+        return ctx.replyWithDocument(
+          { source: buf, filename: outName },
+          { caption: "✅ 修改完成！\n\n用 /save [版本名] 保存" }
+        );
+      });
       pendingFix.delete(userId);
       
     } catch (err) {
@@ -1381,6 +1413,52 @@ bot.command("weekly", async function(ctx) {
   }
 });
 
+
+bot.command("imagine", async function(ctx) {
+  if (!GEMINI_API_KEY) {
+    return ctx.reply("图片生成未启用。请在 Railway Variables 添加 GEMINI_API_KEY。\n\n去 aistudio.google.com 获取免费 API Key。");
+  }
+  const prompt = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!prompt) return ctx.reply("用法：/imagine 一只赛博朋克风格的猫");
+
+  await ctx.reply("🎨 生成中... 请稍等");
+  await ctx.sendChatAction("upload_photo");
+
+  setImmediate(async function() {
+    try {
+      const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent?key=" + GEMINI_API_KEY, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseModalities: ["IMAGE", "TEXT"] }
+        })
+      });
+
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error && data.error.message || "API error " + res.status);
+
+      // Find image part
+      const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts || [];
+      const imgPart = parts.find(function(p) { return p.inlineData && p.inlineData.mimeType && p.inlineData.mimeType.startsWith("image/"); });
+
+      if (!imgPart) throw new Error("没有生成图片，请换一个描述试试。");
+
+      const imgBuffer = Buffer.from(imgPart.inlineData.data, "base64");
+      const mimeType = imgPart.inlineData.mimeType;
+      const ext = mimeType.includes("png") ? "png" : "jpg";
+
+      await ctx.replyWithPhoto(
+        { source: imgBuffer, filename: "image." + ext },
+        { caption: "🎨 " + prompt }
+      );
+    } catch (err) {
+      console.error("Imagine error:", err.message);
+      await ctx.reply("生成失败: " + err.message).catch(function(){});
+    }
+  });
+});
+
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
   let userMessage = ctx.message.text;
@@ -1395,8 +1473,13 @@ bot.on("text", async function(ctx) {
     }
   }
 
-  // Handle pending fix reply
+  // Handle /fix flow - user typing instructions after /fix with no args
   const fixReply = pendingFix.get(userId);
+  if (fixReply && !fixReply.waiting && fixReply.instructions === null && !userMessage.startsWith("/")) {
+    // User just typed their instructions
+    pendingFix.set(userId, { waiting: true, instructions: userMessage, createdAt: Date.now() });
+    return ctx.reply("✅ 明白！任务：" + userMessage + "\n\n现在发 .py 文件给我 👇");
+  }
   if (fixReply && fixReply.waiting && fixReply.originalCode && !userMessage.startsWith("/")) {
     const wantsfix = userMessage.includes("修") || userMessage.toLowerCase().includes("fix") || userMessage.includes("要") || userMessage.includes("是") || userMessage.includes("好");
     if (wantsfix) {
@@ -1840,6 +1923,7 @@ bot.telegram.setMyCommands([
   { command: "setsoul", description: "✏️ 更新 soul.md" },
   { command: "setprojects", description: "✏️ 更新项目" },
   { command: "settasks", description: "✏️ 更新任务" },
+  { command: "imagine", description: "🎨 AI 图片生成 /imagine [描述]" },
   { command: "fix", description: "🔧 修改现有代码文件" },
   { command: "code", description: "💻 生成完整代码文件（任何语言）" },
   { command: "codestop", description: "⏹ 退出 Code 模式" },
