@@ -12,6 +12,8 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN;
+const MAIN_MODEL = process.env.AI_MODEL || "claude-opus-4-5";
+const FAST_MODEL = process.env.AI_FAST_MODEL || "claude-haiku-4-5-20251001";
 const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN || !ANTHROPIC_API_KEY) {
@@ -41,6 +43,8 @@ const docsStore = new Map();
 const summaryStore = new Map();
 const vectorStore = new Map();
 const processingLock = new Map(); // prevent concurrent processing per user
+const mediaGroupCache = new Map(); // cache files from same media group
+const MEDIA_GROUP_WAIT_MS = 1500; // wait 1.5s to collect all files in group
 const docsCache = new Map(); // cache docs for 60 seconds
 const CACHE_TTL = 60000;
 
@@ -71,7 +75,7 @@ async function withLock(userId, fn) {
   }
 }
 
-const RECENT_MESSAGES = 50;
+const RECENT_MESSAGES = 20; // keep last 20 messages max
 const MAX_SUMMARIES = 8;
 const SUMMARIZE_EVERY = 20;
 const TOP_MEMORIES = 12;
@@ -96,14 +100,26 @@ async function getHistory(userId) {
 async function saveMessage(userId, role, content) {
   if (supabase) {
     try {
-      await supabase.from("conversations").insert({ user_id: userId, role, content });
+      const uid = parseInt(userId);
+      await supabase.from("conversations").insert({ user_id: uid, role, content });
+      // Auto-delete messages beyond RECENT_MESSAGES limit
+      const { data: oldMsgs } = await supabase
+        .from("conversations")
+        .select("id")
+        .eq("user_id", uid)
+        .order("created_at", { ascending: false })
+        .range(RECENT_MESSAGES, RECENT_MESSAGES + 100);
+      if (oldMsgs && oldMsgs.length > 0) {
+        const ids = oldMsgs.map(function(r) { return r.id; });
+        await supabase.from("conversations").delete().in("id", ids);
+      }
       return;
     } catch (err) { console.error("saveMessage error:", err.message); }
   }
   if (!memoryStore.has(userId)) memoryStore.set(userId, []);
   const h = memoryStore.get(userId);
   h.push({ role, content });
-  if (h.length > 100) h.splice(0, h.length - 100);
+  if (h.length > RECENT_MESSAGES) h.splice(0, h.length - RECENT_MESSAGES);
 }
 
 async function countMessages(userId) {
@@ -309,7 +325,7 @@ async function autoLearnMemory(userId, userMessage, aiReply) {
   // Quick check: is this conversation worth learning from?
   try {
     const worthCheck = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
+      model: FAST_MODEL,
       max_tokens: 5,
       messages: [{ role: "user", content: "Does this conversation contain new facts, preferences, projects or decisions worth remembering long-term? Answer YES or NO only.\n\nUser: " + userMessage.substring(0, 200) + "\nAssistant: " + aiReply.substring(0, 200) }]
     });
@@ -328,7 +344,7 @@ async function autoLearnMemory(userId, userMessage, aiReply) {
       '{"soul":"","projects":"","tasks":"","notes":"","memories":[]}';
 
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
+      model: FAST_MODEL,
       max_tokens: 800,
       messages: [{ role: "user", content: extractPrompt }]
     });
@@ -368,7 +384,7 @@ async function maybeAutoSummarize(userId) {
         return (m.role === "user" ? "用户" : "AI") + ": " + m.content;
       }).join("\n");
       const response = await anthropic.messages.create({
-        model: "claude-opus-4-5",
+        model: MAIN_MODEL,
         max_tokens: 500,
         messages: [{ role: "user", content: "请把以下对话压缩成简短摘要（100字以内），保留重要信息。用中文。\n\n" + historyText }]
       });
@@ -412,7 +428,7 @@ async function needsSearch(message) {
   if (message.startsWith("```") || message.includes("error:") && message.length < 50) return false;
   try {
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
+      model: FAST_MODEL,
       max_tokens: 10,
       messages: [{
         role: "user",
@@ -447,8 +463,14 @@ async function buildSystemPrompt(userId, userMessage) {
   prompt += "- Detailed tasks = full complete replies without stopping\n";
   prompt += "- Always reply in the same language the user wrote in\n";
   prompt += "- Never stop mid-reply\n";
+  prompt += "- You actively learn from the user's decisions (skip/do) to improve future recommendations\n";
+  prompt += "- When user says skip/跳过/pass or do/做/yes to a bounty, acknowledge and remember their preference\n";
   prompt += "- For code: ALWAYS write the complete code in ONE reply, never split across messages\n";
-  prompt += "- If code is long, still write it all - it will be sent as a file automatically\n\n";
+  prompt += "- If code is long, still write it all in ONE reply - it will be sent as a single .txt file automatically\n";
+  prompt += "- NEVER split code across multiple replies. If you cannot fit everything, write a shorter but COMPLETE version\n";
+  prompt += "- For code tasks: complete > perfect. One complete file is better than two partial files\n";
+  prompt += "- If user says 继续/continue/还不完整, check notes for the last unfinished task and continue from where you left off\n";
+  prompt += "- When starting a long code generation task, briefly state what you will generate before starting\n\n";
 
   if (docs.soul) prompt += "=== WHO THE USER IS ===\n" + docs.soul + "\n\n";
   if (docs.projects) prompt += "=== USER PROJECTS ===\n" + docs.projects + "\n\n";
@@ -479,7 +501,26 @@ async function askClaude(userId, userMessage, ctx) {
     getHistory(userId)
   ]);
 
-  let messages = history.length > 0 ? [...history] : [{ role: "user", content: userMessage }];
+  // Trim history if total content is too large to prevent timeouts
+  let messages;
+  if (history.length > 0) {
+    const totalChars = history.reduce(function(sum, m) { return sum + (m.content || "").length; }, 0);
+    if (totalChars > 20000) {
+      // Keep last 10 messages, but truncate each to 2000 chars max
+      const trimmed = history.slice(-10).map(function(m) {
+        const c = m.content || "";
+        return c.length > 2000
+          ? { role: m.role, content: c.substring(0, 2000) + "...[已截断]" }
+          : m;
+      });
+      messages = trimmed;
+      console.log("History trimmed: " + history.length + " msgs, " + totalChars + " chars → " + trimmed.length + " msgs");
+    } else {
+      messages = [...history];
+    }
+  } else {
+    messages = [{ role: "user", content: userMessage }];
+  }
   let activeSystemPrompt = systemPrompt;
 
   // 如果需要搜索，先搜索再把结果加进对话
@@ -497,9 +538,17 @@ async function askClaude(userId, userMessage, ctx) {
   const UPDATE_INTERVAL = 1500; // update every 1.5 seconds
 
   try {
+    // Detect if this is a code generation request
+    const isCodeGen = messages.length > 0 && messages[messages.length-1] &&
+      (String(messages[messages.length-1].content).includes("完整") ||
+       String(messages[messages.length-1].content).includes("complete") ||
+       String(messages[messages.length-1].content).includes("v\d") ||
+       String(messages[messages.length-1].content).includes("全部代码"));
+    const maxTok = 8192; // Opus max is 8192
+
     const stream = anthropic.messages.stream({
-      model: "claude-opus-4-5",
-      max_tokens: 8192,
+      model: MAIN_MODEL,
+      max_tokens: maxTok,
       system: activeSystemPrompt,
       messages: messages
     });
@@ -520,8 +569,9 @@ async function askClaude(userId, userMessage, ctx) {
       }
     }
 
-    // Final update or send full response
+    // Clear typing interval and delete placeholder
     if (ctx && sentMsg) {
+      if (sentMsg._typingInterval) clearInterval(sentMsg._typingInterval);
       try {
         await ctx.telegram.deleteMessage(ctx.chat.id, sentMsg.message_id);
       } catch (e) { /* ignore */ }
@@ -531,14 +581,19 @@ async function askClaude(userId, userMessage, ctx) {
     // Fallback to non-streaming
     if (!reply) {
       const response = await anthropic.messages.create({
-        model: "claude-opus-4-5", max_tokens: 8192,
+        model: MAIN_MODEL, max_tokens: 8192,
         system: activeSystemPrompt, messages: messages
       });
       reply = (response.content.find(function(b) { return b.type === "text"; }) || {}).text || "出错了，请再试一次。";
     }
   }
 
-  await saveMessage(userId, "assistant", reply);
+  // Save truncated version to history if reply is code-heavy (saves space)
+  const hasCode = reply.includes("```") || reply.includes("def ") || reply.includes("function ");
+  const toSave = (hasCode && reply.length > 1000)
+    ? "[代码回复，" + reply.length + " 字符] " + reply.substring(0, 200) + "..."
+    : reply;
+  await saveMessage(userId, "assistant", toSave);
   countMessages(userId).then(function(count) {
     const tasks = [maybeAutoSummarize(userId)];
     if (count % 5 === 0) tasks.push(autoLearnMemory(userId, userMessage, reply));
@@ -702,6 +757,26 @@ async function railwayDeploy(repoUrl, projectName, envVars) {
   };
 }
 
+// ── Retry helper ─────────────────────────────────────────────────────────────
+async function withRetry(fn, retries, delayMs) {
+  retries = retries || 3;
+  delayMs = delayMs || 2000;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const is429 = err.message && err.message.includes("429");
+      const retryAfter = is429 ? parseInt((err.message.match(/retry after (\d+)/) || [])[1] || "5") * 1000 : delayMs;
+      if (i < retries - 1) {
+        console.log("Retry " + (i+1) + "/" + retries + " after " + retryAfter + "ms:", err.message);
+        await new Promise(function(r) { setTimeout(r, retryAfter); });
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 // ── Vibe Coding ───────────────────────────────────────────────────────────────
 const vibeSessions = new Map();
 
@@ -763,7 +838,7 @@ async function pushFilesToGitHub(owner, repoName, files) {
 
 async function generateProjectFiles(idea, techStack, details) {
   const prompt = "You are an expert developer. Generate a complete, production-ready project.\n\nPROJECT IDEA: " + idea + "\nTECH STACK: " + techStack + "\nADDITIONAL DETAILS: " + (details || "none") + "\n\nReturn a JSON object where keys are file paths and values are file contents. Include ALL necessary files: main code, package.json or requirements.txt, README.md, .gitignore, and config files. Make the code complete and runnable - no placeholders.\n\nReturn ONLY valid JSON, no explanation, no markdown backticks.";
-  const res = await anthropic.messages.create({ model: "claude-opus-4-5", max_tokens: 4096, messages: [{ role: "user", content: prompt }] });
+  const res = await anthropic.messages.create({ model: MAIN_MODEL, max_tokens: 4096, messages: [{ role: "user", content: prompt }] });
   const text = (res.content[0] || {}).text || "{}";
   const clean = text.replace(/^```json\n?|^```\n?|```$/gm, "").trim();
   return JSON.parse(clean);
@@ -773,13 +848,13 @@ async function reviewAndFixFiles(files, idea, techStack) {
   const filesSummary = Object.entries(files).map(function(entry) {
     const path = entry[0];
     const code = entry[1];
-    return "=== " + path + " ===\n" + code.substring(0, 1500) + (code.length > 1500 ? "\n...[truncated]" : "");
+    return "=== " + path + " ===\n" + code.substring(0, 4000) + (code.length > 4000 ? "\n...[truncated]" : "");
   }).join("\n\n");
 
   const reviewPrompt = "You are a senior developer reviewing code before deployment.\n\nProject idea: " + idea + "\nTech stack: " + techStack + "\n\nGenerated files:\n" + filesSummary + "\n\nReview the code and fix any issues:\n1. Syntax errors or typos\n2. Missing imports or dependencies\n3. Broken logic or incomplete functions\n4. Security issues (hardcoded secrets, etc)\n5. Missing error handling\n\nReturn ONLY a JSON object with the fixed files (same structure: filepath -> content). If a file is fine, include it unchanged. Return ONLY valid JSON, no explanation.";
 
   const res = await anthropic.messages.create({
-    model: "claude-opus-4-5",
+    model: MAIN_MODEL,
     max_tokens: 8192,
     messages: [{ role: "user", content: reviewPrompt }]
   });
@@ -803,6 +878,327 @@ bot.command("vibe", async function(ctx) {
 bot.command("vibestop", async function(ctx) {
   vibeSessions.delete(ctx.from.id);
   await ctx.reply("已退出 Vibe Coding 模式。");
+});
+
+
+// ── 决策学习系统 ────────────────────────────────────────────────────────────────
+async function recordDecision(userId, bountyInfo, decision) {
+  try {
+    const memory = "用户对赏金决策: " + decision + " | " + bountyInfo.substring(0, 200);
+    await autoLearnMemory(userId, "[决策记录]", memory);
+    console.log("Decision recorded:", decision, bountyInfo.substring(0, 50));
+  } catch (err) {
+    console.error("Record decision error:", err.message);
+  }
+}
+
+async function learnFromDecision(userId, userMessage) {
+  const skipKeywords = ["跳过", "skip", "不做", "pass", "算了", "不要", "no"];
+  const doKeywords = ["做", "要做", "参加", "yes", "好", "来", "行", "可以"];
+
+  const isSkip = skipKeywords.some(function(k) { return userMessage.toLowerCase().includes(k); });
+  const isDo = doKeywords.some(function(k) { return userMessage.toLowerCase() === k || userMessage.toLowerCase().startsWith(k + " ") || userMessage.toLowerCase().startsWith(k + "，"); });
+
+  if (!isSkip && !isDo) return null;
+
+  // Get recent conversation to understand what they're deciding on
+  const history = await getHistory(userId);
+  const lastBotMsg = history.filter(function(m) { return m.role === "assistant"; }).slice(-1)[0];
+  if (!lastBotMsg) return null;
+
+  const decision = isSkip ? "跳过" : "参与";
+  const context = lastBotMsg.content.substring(0, 300);
+
+  // Extract patterns to learn
+  const learnPrompt = "User made a decision about a bounty. Extract what to learn about their preferences.\n\nDecision: " + decision + "\nBounty context: " + context + "\n\nReturn JSON: {\"learning\": \"one sentence about their preference\", \"min_reward\": number or null, \"preferred_types\": [\"content\"|\"dev\"|\"audit\"] or null}";
+
+  const res = await anthropic.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 150,
+    messages: [{ role: "user", content: learnPrompt }]
+  });
+  const text = (res.content[0] || {}).text || "{}";
+  try {
+    const clean = text.replace(/```json|```/g, "").trim();
+    const learned = JSON.parse(clean);
+    if (learned.learning) {
+      await recordDecision(userId, context, decision + ": " + learned.learning);
+      return learned;
+    }
+  } catch (e) {}
+  return null;
+}
+
+
+// ── 代码版本管理 ──────────────────────────────────────────────────────────────
+async function saveCodeVersion(userId, versionName, code) {
+  if (!supabase) return false;
+  try {
+    const uid = parseInt(userId);
+    const { error } = await supabase.from("user_docs").upsert({
+      user_id: uid,
+      doc_type: "code_" + versionName.toLowerCase().replace(/\s+/g, "_"),
+      content: code,
+      updated_at: new Date().toISOString()
+    }, { onConflict: "user_id,doc_type" });
+    return !error;
+  } catch (e) { return false; }
+}
+
+async function getCodeVersion(userId, versionName) {
+  if (!supabase) return null;
+  try {
+    const uid = parseInt(userId);
+    const { data } = await supabase.from("user_docs")
+      .select("content,updated_at")
+      .eq("user_id", uid)
+      .eq("doc_type", "code_" + versionName.toLowerCase().replace(/\s+/g, "_"))
+      .maybeSingle();
+    return data || null;
+  } catch (e) { return null; }
+}
+
+async function listCodeVersions(userId) {
+  if (!supabase) return [];
+  try {
+    const uid = parseInt(userId);
+    const { data } = await supabase.from("user_docs")
+      .select("doc_type,updated_at")
+      .eq("user_id", uid)
+      .like("doc_type", "code_%")
+      .order("updated_at", { ascending: false });
+    return (data || []).map(function(d) {
+      return { name: d.doc_type.replace("code_", ""), updated: d.updated_at };
+    });
+  } catch (e) { return []; }
+}
+
+
+bot.command("save", async function(ctx) {
+  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!args) return ctx.reply("用法：/save v11\n或：/save v11 [附上代码文件]");
+  const userId = ctx.from.id;
+  const versionName = args;
+
+  // Check if there's a recent code reply to save
+  const history = await getHistory(userId);
+  const lastCode = history.slice().reverse().find(function(m) {
+    return m.role === "assistant" && (m.content.includes("```") || m.content.includes("[代码回复"));
+  });
+
+  if (!lastCode) return ctx.reply("没找到最近的代码回复，请先生成代码再 /save " + versionName);
+
+  const ok = await saveCodeVersion(userId, versionName, lastCode.content);
+  await ctx.reply(ok ? "✅ 已保存为 " + versionName : "保存失败，请重试。");
+});
+
+bot.command("versions", async function(ctx) {
+  const userId = ctx.from.id;
+  const versions = await listCodeVersions(userId);
+  if (versions.length === 0) return ctx.reply("还没有保存任何代码版本。\n用 /save v1 保存当前代码。");
+  const list = versions.map(function(v) {
+    return "• " + v.name + " (" + new Date(v.updated).toLocaleDateString("zh") + ")";
+  }).join("\n");
+  await ctx.reply("📦 已保存的版本：\n\n" + list + "\n\n用 /load [版本名] 加载");
+});
+
+bot.command("load", async function(ctx) {
+  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!args) return ctx.reply("用法：/load v11");
+  const userId = ctx.from.id;
+  const ver = await getCodeVersion(userId, args);
+  if (!ver) return ctx.reply("找不到版本 " + args + "，用 /versions 查看所有版本。");
+  const code = ver.content;
+  if (code.length > 3800) {
+    const buf = Buffer.from(code, "utf-8");
+    const ts = new Date().toISOString().slice(11,16).replace(":","");
+    await ctx.replyWithDocument({ source: buf, filename: args + "_" + ts + ".txt" }, { caption: "📦 " + args + " 代码（直接复制粘贴）" });
+  } else {
+    await ctx.reply(code);
+  }
+});
+
+
+// Code mode state
+const codeSessions = new Map();
+
+bot.command("code", async function(ctx) {
+  const userId = ctx.from.id;
+  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
+
+  if (!args) {
+    codeSessions.set(userId, { active: true, task: null });
+    return ctx.reply("💻 进入 Code 模式\n\n说说你要生成什么代码？");
+  }
+
+  codeSessions.set(userId, { active: true, task: args });
+  await ctx.reply("💻 Code 模式\n任务：" + args + "\n\n分段生成中，请稍等...");
+
+  setImmediate(async function() {
+    try {
+      await ctx.sendChatAction("typing");
+
+      // Direct generation - no outline step (outline causes hallucination)
+      // Split into 2 passes: first half, second half, then combine
+      await ctx.reply("⚙️ [1/2] 生成前半部分...");
+      const res1 = await anthropic.messages.create({
+        model: MAIN_MODEL, max_tokens: 8192,
+        system: "You are an expert programmer. Write EXACTLY what is asked. Do not invent generic modules. Write specific, working code for the exact task described.",
+        messages: [{ role: "user", content: "Write the FIRST HALF of complete Python code for: " + args + "\n\nInclude: imports, configuration, and main classes/functions (first half only). End with a comment '# === CONTINUED IN PART 2 ===' at the bottom. No markdown." }]
+      });
+      const part1 = ((res1.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
+
+      await ctx.reply("⚙️ [2/2] 生成后半部分...");
+      await ctx.sendChatAction("typing");
+      const res2 = await anthropic.messages.create({
+        model: MAIN_MODEL, max_tokens: 8192,
+        system: "You are an expert programmer. Continue writing the second half of the code.",
+        messages: [
+          { role: "user", content: "Write the FIRST HALF of complete Python code for: " + args },
+          { role: "assistant", content: part1 },
+          { role: "user", content: "Now write the SECOND HALF - continue from where you left off. Include: remaining functions, main loop, error handling, and entry point (if __name__ == '__main__'). No markdown, just code." }
+        ]
+      });
+      const part2 = ((res2.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
+
+      const fullCode = part1 + "\n\n" + part2;
+      await ctx.reply("🔗 合并完成...");
+
+      const buf = Buffer.from(fullCode, "utf-8");
+      const ts = new Date().toISOString().slice(11,16).replace(":","");
+      await ctx.replyWithDocument(
+        { source: buf, filename: "code_" + ts + ".txt" },
+        { caption: "✅ 完整代码\n\n用 /save [版本名] 保存" }
+      );
+
+    } catch (err) {
+      console.error("Code gen error:", err.message);
+      await ctx.reply("生成失败: " + err.message).catch(function(){});
+    }
+  });
+});
+
+
+// Store pending fix tasks (file content + instructions)
+const pendingFix = new Map();
+
+bot.command("fix", async function(ctx) {
+  const userId = ctx.from.id;
+  const instructions = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  
+  if (!instructions) {
+    pendingFix.set(userId, { waiting: true, instructions: null });
+    return ctx.reply("🔧 Fix 模式\n\n先告诉我要修什么？\n（然后发 .py 文件给我）");
+  }
+  
+  pendingFix.set(userId, { waiting: true, instructions });
+  await ctx.reply("🔧 Fix 模式\n\n任务：" + instructions + "\n\n现在发 .py 文件给我 👇");
+});
+
+
+async function autoAnalyzeAndFix(ctx, userId, fileName, fileText) {
+  await ctx.reply("🔍 自动分析 " + fileName + "（" + fileText.length + " 字符）...\n\n找 bug、优化点和潜在问题");
+  await ctx.sendChatAction("typing");
+
+  setImmediate(async function() {
+    try {
+      const CHUNK = 20000;
+      const sample = fileText.length > CHUNK
+        ? fileText.substring(0, CHUNK) + "\n...[文件过长，显示前 " + CHUNK + " 字符]"
+        : fileText;
+
+      // Step 1: Analyze
+      const analysisRes = await anthropic.messages.create({
+        model: MAIN_MODEL, max_tokens: 2000,
+        system: "You are a senior Python code reviewer. Analyze code and find real issues.",
+        messages: [{ role: "user", content: "Analyze this Python file and find:\n1. Bugs and errors\n2. Missing features\n3. Risk areas\n4. Optimization opportunities\n\nFile: " + fileName + "\n\n" + sample + "\n\nProvide a clear, actionable analysis in Chinese. Be specific about line numbers or function names when possible." }]
+      });
+      const analysis = (analysisRes.content[0] || {}).text || "";
+      await sendLongMessage(ctx, "📊 **" + fileName + " 分析报告**\n\n" + analysis);
+
+      // Step 2: Ask if they want fixes
+      await ctx.reply("要我生成修复版吗？\n\n直接回复 '修复' 或告诉我要修哪些问题");
+      pendingFix.set(userId, { waiting: true, instructions: "__auto__", originalCode: fileText, fileName });
+
+    } catch (err) {
+      console.error("Auto analyze error:", err.message);
+      await ctx.reply("分析失败: " + err.message).catch(function(){});
+    }
+  });
+}
+
+async function processFileFix(ctx, userId, fileName, fileText, instructions) {
+  await ctx.reply("📖 读取完毕（" + fileText.length + " 字符）\n⚙️ 开始修改，请稍等...");
+
+  const CHUNK = 25000;
+  
+  setImmediate(async function() {
+    try {
+      let fullCode = "";
+      
+      if (fileText.length <= CHUNK) {
+        // Small file - fix in one shot
+        const res = await anthropic.messages.create({
+          model: MAIN_MODEL, max_tokens: 8192,
+          system: "You are an expert Python programmer. Fix/modify the code as instructed. Output ONLY the complete modified Python code, no explanations, no markdown backticks.",
+          messages: [{ role: "user", content: "File: " + fileName + "\n\nInstructions: " + instructions + "\n\nOriginal code:\n" + fileText + "\n\nOutput the complete modified code:" }]
+        });
+        fullCode = (res.content[0] || {}).text || "";
+      } else {
+        // Large file - process in chunks, then merge
+        const chunks = [];
+        for (let i = 0; i < fileText.length; i += CHUNK) {
+          chunks.push(fileText.substring(i, i + CHUNK));
+        }
+        
+        await ctx.reply("📦 文件较大，分 " + chunks.length + " 段处理...");
+        
+        // First pass: understand the full structure
+        const structRes = await anthropic.messages.create({
+          model: FAST_MODEL, max_tokens: 1000,
+          system: "Analyze code structure briefly.",
+          messages: [{ role: "user", content: "List the main functions/classes in this code (first " + CHUNK + " chars):\n" + chunks[0] }]
+        });
+        const structure = (structRes.content[0] || {}).text || "";
+        
+        // Fix each chunk
+        const fixedChunks = [];
+        for (let i = 0; i < chunks.length; i++) {
+          await ctx.reply("⚙️ [" + (i+1) + "/" + chunks.length + "] 修改中...");
+          await ctx.sendChatAction("typing");
+          const res = await anthropic.messages.create({
+            model: MAIN_MODEL, max_tokens: 8192,
+            system: "You are fixing part " + (i+1) + " of " + chunks.length + " of a Python file. Apply the fix instructions only where relevant in this section. Output ONLY the code for this section, no explanations.",
+            messages: [{ role: "user", content: "File: " + fileName + "\nFull structure: " + structure + "\n\nFix instructions: " + instructions + "\n\nThis section (part " + (i+1) + "/" + chunks.length + "):\n" + chunks[i] + "\n\nOutput fixed code for this section:" }]
+          });
+          fixedChunks.push((res.content[0] || {}).text || chunks[i]);
+        }
+        fullCode = fixedChunks.join("\n");
+      }
+      
+      // Clean up and send
+      fullCode = fullCode.replace(/^```python\n?|^```\n?|```$/gm, "").trim();
+      const buf = Buffer.from(fullCode, "utf-8");
+      const ts = new Date().toISOString().slice(11,16).replace(":","");
+      const outName = fileName.replace(".py", "_fixed_" + ts + ".py");
+      
+      await ctx.replyWithDocument(
+        { source: buf, filename: outName },
+        { caption: "✅ 修改完成！\n\n用 /save [版本名] 保存" }
+      );
+      pendingFix.delete(userId);
+      
+    } catch (err) {
+      console.error("Fix error:", err.message);
+      await ctx.reply("修改失败: " + err.message).catch(function(){});
+      pendingFix.delete(userId);
+    }
+  });
+}
+
+bot.command("codestop", async function(ctx) {
+  codeSessions.delete(ctx.from.id);
+  await ctx.reply("已退出 Code 模式。");
 });
 
 bot.command("memory", async function(ctx) {
@@ -892,7 +1288,7 @@ bot.command("summarize", async function(ctx) {
     if (history.length === 0) return ctx.reply("No conversation to summarize.");
     const historyText = history.map(function(m) { return (m.role === "user" ? "用户" : "AI") + ": " + m.content; }).join("\n");
     const response = await anthropic.messages.create({
-      model: "claude-opus-4-5",
+      model: MAIN_MODEL,
       max_tokens: 500,
       messages: [{ role: "user", content: "请把以下对话压缩成简短摘要（100字以内）。用中文。\n\n" + historyText }]
     });
@@ -950,9 +1346,80 @@ bot.command("deploy", async function(ctx) {
   }
 });
 
+
+bot.command("weekly", async function(ctx) {
+  const userId = ctx.from.id;
+  await ctx.sendChatAction("typing");
+  try {
+    const [memories, summaries] = await Promise.all([
+      supabase ? supabase.from("memories").select("content,created_at")
+        .eq("user_id", parseInt(userId))
+        .gte("created_at", new Date(Date.now() - 7*24*60*60*1000).toISOString())
+        .order("created_at", { ascending: false }) : { data: [] },
+      supabase ? supabase.from("conversation_summaries").select("summary,created_at")
+        .eq("user_id", parseInt(userId))
+        .gte("created_at", new Date(Date.now() - 7*24*60*60*1000).toISOString())
+        .order("created_at", { ascending: false }) : { data: [] }
+    ]);
+
+    const memData = (memories.data || []).map(function(m) { return m.content; }).join("\n");
+    const sumData = (summaries.data || []).map(function(s) { return s.summary; }).join("\n");
+
+    if (!memData && !sumData) {
+      return ctx.reply("这周还没有足够的数据生成周报。");
+    }
+
+    const reportRes = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 600,
+      messages: [{ role: "user", content: "Generate a brief weekly summary in Chinese based on this user activity data.\n\nMemories this week:\n" + memData.substring(0, 1000) + "\n\nConversation summaries:\n" + sumData.substring(0, 1000) + "\n\nInclude: what they worked on, decisions made, patterns noticed, suggestions for next week. Keep it concise and actionable." }]
+    });
+    const report = (reportRes.content[0] || {}).text || "无法生成周报。";
+    await sendLongMessage(ctx, "📊 本周总结\n\n" + report);
+  } catch (err) {
+    await ctx.reply("生成周报失败: " + err.message);
+  }
+});
+
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
-  const userMessage = ctx.message.text;
+  let userMessage = ctx.message.text;
+
+  // If replying to a long message, trim the context
+  if (ctx.message.reply_to_message && ctx.message.reply_to_message.text) {
+    const quotedLen = ctx.message.reply_to_message.text.length;
+    if (quotedLen > 500) {
+      // Just use the user's own message, ignore the quoted context
+      // Claude already has conversation history
+      userMessage = userMessage; // keep as is, history handles context
+    }
+  }
+
+  // Handle pending fix reply
+  const fixReply = pendingFix.get(userId);
+  if (fixReply && fixReply.waiting && fixReply.originalCode && !userMessage.startsWith("/")) {
+    const wantsfix = userMessage.includes("修") || userMessage.toLowerCase().includes("fix") || userMessage.includes("要") || userMessage.includes("是") || userMessage.includes("好");
+    if (wantsfix) {
+      const instructions = fixReply.instructions === "__auto__" ? userMessage : fixReply.instructions;
+      const fn = fixReply.fileName || "code.py";
+      const code = fixReply.originalCode;
+      pendingFix.delete(userId);
+      await ctx.reply("🔧 开始生成修复版...");
+      return await processFileFix(ctx, userId, fn, code, instructions === "__auto__" ? "Fix all the issues found in the analysis" : instructions);
+    }
+  }
+
+  // Learn from user decisions (skip/do on bounties)
+  if (!userMessage.startsWith("/")) {
+    learnFromDecision(userId, userMessage).catch(function(e) {});
+  }
+
+  // Warn if history is getting very long
+  const historyCheck = await getHistory(userId);
+  const totalHistoryChars = historyCheck.reduce(function(sum, m) { return sum + (m.content || "").length; }, 0);
+  if (totalHistoryChars > 30000 && !userMessage.startsWith("/")) {
+    await ctx.reply("⚠️ 对话历史很长，可能影响回复速度。建议发 /forget 清理历史（记忆档案不会丢失）。").catch(function(){});
+  }
 
   // Handle vibe coding session
   if (vibeSessions.has(userId) && !userMessage.startsWith("/")) {
@@ -1065,13 +1532,24 @@ bot.on("text", async function(ctx) {
     }
   }
 
+  // Save code generation requests to notes for continuity after /forget
+  const isCodeRequest = /完整|complete|全部|v\d+|修复版|完整版/i.test(userMessage);
+  if (isCodeRequest && userMessage.length < 200) {
+    // Save the request to notes so it survives /forget
+    const currentNotes = await getDoc(userId, "notes") || "";
+    if (!currentNotes.includes(userMessage)) {
+      const taskNote = "【未完成任务】" + new Date().toLocaleString("zh") + ": " + userMessage;
+      await setDoc(userId, "notes", taskNote + (currentNotes ? "\n" + currentNotes : ""));
+    }
+  }
+
   // Auto-summarize if message too long
   let processedMessage = userMessage;
   if (userMessage.length > 3000) {
     try {
       await ctx.sendChatAction("typing");
       const summaryRes = await anthropic.messages.create({
-        model: "claude-haiku-4-5-20251001",
+        model: FAST_MODEL,
         max_tokens: 800,
         messages: [{
           role: "user",
@@ -1087,19 +1565,22 @@ bot.on("text", async function(ctx) {
     }
   }
 
-  await ctx.sendChatAction("typing");
-  try {
-    const result = await withLock(userId, async function() {
-      return await askClaude(userId, processedMessage, ctx);
-    });
-    if (result) {
-      await sendLongMessage(ctx, result);
+  // Immediately acknowledge to Telegraf (avoids 90s timeout)
+  // Process in background and send result when ready
+  setImmediate(async function() {
+    try {
+      await ctx.sendChatAction("typing");
+      const result = await withLock(userId, async function() {
+        return await askClaude(userId, processedMessage, ctx);
+      });
+      if (result) {
+        await sendLongMessage(ctx, result);
+      }
+    } catch (err) {
+      console.error("Claude error:", err.message);
+      try { await ctx.reply("出错了，请稍后再试。"); } catch(e) {}
     }
-    // if null, silently drop duplicate request
-  } catch (err) {
-    console.error("Claude error:", err.message);
-    await ctx.reply("出错了，请稍后再试。");
-  }
+  });
 });
 
 // ── 处理图片 ──────────────────────────────────────────────────────────────────
@@ -1125,7 +1606,7 @@ bot.on("photo", async function(ctx) {
       ]
     });
     const response = await anthropic.messages.create({
-      model: "claude-opus-4-5",
+      model: MAIN_MODEL,
       max_tokens: 4096,
       system: systemPrompt,
       messages: msgs
@@ -1141,16 +1622,80 @@ bot.on("photo", async function(ctx) {
   }
 });
 
+
+// Process multiple files at once
+async function processMultipleDocs(ctx, userId, docs, caption) {
+  await ctx.sendChatAction("typing");
+  const instruction = caption || "分析这些文件，给我综合总结和关键信息。";
+  const contents = [];
+
+  for (const doc of docs) {
+    const mime = doc.mime_type || "";
+    const fileName = doc.file_name || "file";
+    try {
+      const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+      const response = await fetch(fileLink.href);
+
+      if (mime === "application/pdf") {
+        const arrayBuffer = await response.arrayBuffer();
+        const base64 = Buffer.from(arrayBuffer).toString("base64");
+        contents.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } });
+        contents.push({ type: "text", text: "[文件: " + fileName + "]" });
+      } else {
+        const text = await response.text();
+        const trimmed = text.substring(0, 15000);
+        contents.push({ type: "text", text: "=== " + fileName + " ===\n" + trimmed + (text.length > 15000 ? "\n...[已截断]" : "") });
+      }
+    } catch (e) {
+      contents.push({ type: "text", text: "[无法读取: " + fileName + "]" });
+    }
+  }
+
+  contents.push({ type: "text", text: instruction });
+
+  const result = await withLock(userId, async function() {
+    const systemPrompt = await buildSystemPrompt(userId, instruction);
+    const res = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 8192, system: systemPrompt,
+      messages: [{ role: "user", content: contents }]
+    });
+    return (res.content[0] || {}).text || "无法分析文件。";
+  });
+
+  if (result) {
+    await saveMessage(userId, "user", "[" + docs.length + " 个文件] " + instruction);
+    await saveMessage(userId, "assistant", result);
+    await sendLongMessage(ctx, result);
+  }
+}
+
 bot.on("document", async function(ctx) {
   const doc = ctx.message && ctx.message.document;
   if (!doc) return;
   const mime = doc.mime_type || "";
+  const mediaGroupId = ctx.message.media_group_id;
+
+  // Handle media groups (multiple files sent together)
+  if (mediaGroupId) {
+    if (!mediaGroupCache.has(mediaGroupId)) {
+      mediaGroupCache.set(mediaGroupId, { docs: [], caption: ctx.message.caption || "", userId: ctx.from.id, ctx });
+      // Wait for all files in the group, then process
+      setTimeout(async function() {
+        const group = mediaGroupCache.get(mediaGroupId);
+        mediaGroupCache.delete(mediaGroupId);
+        if (!group || group.docs.length === 0) return;
+        await processMultipleDocs(group.ctx, group.userId, group.docs, group.caption);
+      }, MEDIA_GROUP_WAIT_MS);
+    }
+    mediaGroupCache.get(mediaGroupId).docs.push(doc);
+    return;
+  }
 
   if (mime === "application/pdf") {
     const userId = ctx.from.id;
     await ctx.sendChatAction("upload_document");
     try {
-      const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+      const fileLink = await withRetry(function() { return ctx.telegram.getFileLink(doc.file_id); });
       const response = await fetch(fileLink.href);
       const arrayBuffer = await response.arrayBuffer();
       const base64 = Buffer.from(arrayBuffer).toString("base64");
@@ -1159,7 +1704,7 @@ bot.on("document", async function(ctx) {
       const result = await withLock(userId, async function() {
         const systemPrompt = await buildSystemPrompt(userId, caption);
         const pdfResponse = await anthropic.messages.create({
-          model: "claude-opus-4-5",
+          model: MAIN_MODEL,
           max_tokens: 4096,
           system: systemPrompt,
           messages: [{ role: "user", content: [
@@ -1190,26 +1735,64 @@ bot.on("document", async function(ctx) {
       const userId = ctx.from.id;
       await ctx.sendChatAction("typing");
       try {
-        const fileLink = await ctx.telegram.getFileLink(doc.file_id);
+        const fileLink = await withRetry(function() { return ctx.telegram.getFileLink(doc.file_id); });
         const response = await fetch(fileLink.href);
         const text = await response.text();
-        const caption = ctx.message.caption || "分析这个文件，找出关键信息、错误或问题。";
+        
+        // Check if in fix mode
+        const fixTask = pendingFix.get(userId);
+        if (fixTask && fixTask.waiting && fixTask.instructions) {
+          return await processFileFix(ctx, userId, fileName, text, fixTask.instructions);
+        }
+        const caption = ctx.message.caption || "";
+        // Check if user sent a file with caption as fix instruction
+        if (caption && caption.length > 5 && (caption.includes("修") || caption.includes("fix") || caption.includes("改") || caption.includes("加"))) {
+          return await processFileFix(ctx, userId, fileName, text, caption);
+        }
+        // Auto-analyze .py files and provide suggestions + fixed version
+        if (fileName.endsWith(".py") && !caption) {
+          return await autoAnalyzeAndFix(ctx, userId, fileName, text);
+        }
+        const fileInstruction = caption || "分析这个文件，找出关键信息、错误或问题。";
 
         // Truncate if too long
-        const maxChars = 8000;
-        const fileContent = text.length > maxChars
-          ? text.substring(0, maxChars) + "\n...[文件过长，已截断前 " + maxChars + " 字符]"
-          : text;
+        const CHUNK_SIZE = 30000;
+        const systemPrompt = await buildSystemPrompt(userId, caption);
 
         const result = await withLock(userId, async function() {
-          const systemPrompt = await buildSystemPrompt(userId, caption);
-          const res = await anthropic.messages.create({
-            model: "claude-opus-4-5",
-            max_tokens: 4096,
-            system: systemPrompt,
-            messages: [{ role: "user", content: "文件名: " + fileName + "\n\n文件内容:\n" + fileContent + "\n\n" + caption }]
+          // If file fits in one chunk, process directly
+          if (text.length <= CHUNK_SIZE) {
+            const res = await anthropic.messages.create({
+              model: MAIN_MODEL, max_tokens: 8192, system: systemPrompt,
+              messages: [{ role: "user", content: "文件名: " + fileName + "\n\n文件内容:\n" + text + "\n\n" + fileInstruction }]
+            });
+            return (res.content[0] || {}).text || "无法分析此文件。";
+          }
+
+          // Split into chunks and process each
+          const chunks = [];
+          for (let i = 0; i < text.length; i += CHUNK_SIZE) {
+            chunks.push(text.substring(i, i + CHUNK_SIZE));
+          }
+          await ctx.reply("文件较大，分 " + chunks.length + " 段处理中...");
+
+          const chunkResults = [];
+          for (let i = 0; i < chunks.length; i++) {
+            await ctx.sendChatAction("typing");
+            const res = await anthropic.messages.create({
+              model: MAIN_MODEL, max_tokens: 4096, system: systemPrompt,
+              messages: [{ role: "user", content: "文件名: " + fileName + " (第 " + (i+1) + "/" + chunks.length + " 段)\n\n内容:\n" + chunks[i] + "\n\n请分析这段内容的关键信息。" }]
+            });
+            chunkResults.push("【第 " + (i+1) + " 段分析】\n" + ((res.content[0] || {}).text || ""));
+          }
+
+          // Merge results
+          if (chunks.length === 1) return chunkResults[0];
+          const mergeRes = await anthropic.messages.create({
+            model: MAIN_MODEL, max_tokens: 8192, system: systemPrompt,
+            messages: [{ role: "user", content: "以下是文件 " + fileName + " 分段分析结果，请综合总结：\n\n" + chunkResults.join("\n\n") + "\n\n" + caption }]
           });
-          return (res.content[0] || {}).text || "无法分析此文件。";
+          return (mergeRes.content[0] || {}).text || chunkResults.join("\n\n");
         });
 
         if (result) {
@@ -1245,6 +1828,35 @@ async function launch() {
   }
 }
 
+// Set bot command menu
+bot.telegram.setMyCommands([
+  { command: "memory", description: "📊 完整记忆总览" },
+  { command: "soul", description: "👤 查看 soul.md" },
+  { command: "projects", description: "📁 查看项目" },
+  { command: "tasks", description: "✅ 查看任务" },
+  { command: "notes", description: "📝 查看笔记" },
+  { command: "note", description: "📝 添加笔记" },
+  { command: "summaries", description: "📋 查看对话摘要" },
+  { command: "setsoul", description: "✏️ 更新 soul.md" },
+  { command: "setprojects", description: "✏️ 更新项目" },
+  { command: "settasks", description: "✏️ 更新任务" },
+  { command: "fix", description: "🔧 修改现有代码文件" },
+  { command: "code", description: "💻 生成完整代码文件（任何语言）" },
+  { command: "codestop", description: "⏹ 退出 Code 模式" },
+  { command: "save", description: "💾 保存代码版本 /save v11" },
+  { command: "versions", description: "📦 查看所有保存版本" },
+  { command: "load", description: "📂 加载代码版本 /load v11" },
+  { command: "vibe", description: "🚀 建完整项目并推送 GitHub" },
+  { command: "vibestop", description: "⏹ 退出 Vibe 模式" },
+  { command: "deploy", description: "🚀 自动部署到 Railway" },
+  { command: "weekly", description: "📊 本周活动总结" },
+  { command: "pipeline", description: "🤖 手动触发赏金扫描" },
+  { command: "pipelinestatus", description: "📡 查看 Pipeline 状态" },
+  { command: "forget", description: "🗑 清除对话历史" },
+  { command: "reset", description: "⚠️ 清除所有内容" },
+  { command: "help", description: "❓ 查看所有命令" }
+]).catch(console.error);
+
 launch().catch(console.error);
 
 // PDF 文件处理
@@ -1267,21 +1879,9 @@ bot.on(["message"], async function(ctx) {
     const caption = ctx.message.caption || "请分析这份 PDF 文档，给我摘要和关键要点。";
 
     const result = await withLock(userId, async function() {
-      const docs = await Promise.all([
-        getDoc(userId, "soul"),
-        getDoc(userId, "projects"),
-        getDoc(userId, "tasks"),
-        getDoc(userId, "notes")
-      ]);
-      const [soul, projects, tasks, notes] = docs;
-      let systemPrompt = SYSTEM_PROMPT;
-      if (soul) systemPrompt += "\n\n[USER PROFILE]\n" + soul;
-      if (projects) systemPrompt += "\n\n[PROJECTS]\n" + projects;
-      if (tasks) systemPrompt += "\n\n[TASKS]\n" + tasks;
-      if (notes) systemPrompt += "\n\n[NOTES]\n" + notes;
-
+      const systemPrompt = await buildSystemPrompt(userId, caption);
       const pdfResponse = await anthropic.messages.create({
-        model: "claude-opus-4-5",
+        model: MAIN_MODEL,
         max_tokens: 4096,
         system: systemPrompt,
         messages: [{
@@ -1309,5 +1909,405 @@ bot.on(["message"], async function(ctx) {
   }
 });
 
-process.once("SIGINT", function() { bot.stop("SIGINT"); });
-process.once("SIGTERM", function() { bot.stop("SIGTERM"); });
+
+// ── 监听赏金 Channel ────────────────────────────────────────────────────────────
+const BOUNTY_CHANNEL_ID = -1003866555410;
+const processedChannelPosts = new Set(); // prevent duplicate processing
+
+bot.on("channel_post", async function(ctx) {
+  const post = ctx.channelPost;
+  if (!post || !post.text) return;
+
+  // Bug fix 1: chat.id is a number, compare correctly
+  if (String(ctx.chat.id) !== String(BOUNTY_CHANNEL_ID)) return;
+  if (!PIPELINE_ENABLED || !PIPELINE_OWNER) return;
+
+  // Bug fix 2: deduplicate by message_id
+  const msgId = post.message_id;
+  if (processedChannelPosts.has(msgId)) return;
+  processedChannelPosts.add(msgId);
+  if (processedChannelPosts.size > 500) {
+    const first = processedChannelPosts.values().next().value;
+    processedChannelPosts.delete(first);
+  }
+
+  const text = post.text;
+  if (!text.includes("新增高价值 Bounty") && !text.includes("NEW")) return;
+
+  console.log("New bounty from channel:", text.substring(0, 80));
+
+  try {
+    const lines = text.split("\n");
+
+    // Bug fix 3: strip emoji properly with regex fallback
+    const getLine = function(emoji) {
+      const line = lines.find(function(l) { return l.includes(emoji); }) || "";
+      return line.replace(emoji, "").trim();
+    };
+
+    const title = getLine("📌");
+    const reward = getLine("💰");
+    const typeRaw = getLine("🏷");
+
+    // Bug fix 4: extract URL more reliably
+    const urlMatch = text.match(/https?:\/\/[^ \t\r\n]+/);
+    const url = urlMatch ? urlMatch[0] : "";
+
+    if (!title || !url) {
+      console.log("Skipping - missing title or URL");
+      return;
+    }
+
+    // Region filter
+    const regionLine = lines.find(function(l) { return l.includes("📍"); }) || "";
+    const region = regionLine.replace("📍", "").trim().toLowerCase();
+    if (region && !PIPELINE_REGIONS.some(function(r) { return region.includes(r); })) {
+      console.log("Skipping region:", region);
+      return;
+    }
+
+    const bounty = {
+      id: "channel_" + msgId,
+      title: title,
+      reward: reward,
+      type: typeRaw.toLowerCase(),
+      url: url,
+      description: text,
+      platform: "BountyMonitor"
+    };
+
+    // Bug fix 5: scoring can fail, handle gracefully
+    let scoring;
+    try {
+      scoring = await scoreBounty(bounty);
+    } catch (e) {
+      scoring = { score: 5, type: "unknown", reason: "scoring failed", deliverable: "see link" };
+    }
+
+    const chatId = parseInt(PIPELINE_OWNER);
+
+    await bot.telegram.sendMessage(chatId,
+      "🔔 新赏金 — ⭐ " + scoring.score + "/10\n" +
+      "📌 " + bounty.title + "\n" +
+      "💰 " + bounty.reward + "\n" +
+      "📋 " + scoring.type + " | 🎯 " + (scoring.deliverable || "?") + "\n" +
+      "💡 " + (scoring.reason || "") + "\n" +
+      "🔗 " + bounty.url
+    );
+
+    if (scoring.score >= 7) {
+      await executeBounty(bounty, scoring, bot, chatId);
+    }
+  } catch (err) {
+    console.error("Channel bounty error:", err.message);
+  }
+});
+
+// Global error handler - prevent Bot from crashing on unhandled errors
+process.on("unhandledRejection", function(err) {
+  console.error("Unhandled rejection:", err && err.message ? err.message : err);
+});
+process.on("uncaughtException", function(err) {
+  console.error("Uncaught exception:", err && err.message ? err.message : err);
+});
+
+process.once("SIGINT", function() { 
+  try { bot.stop("SIGINT"); } catch(e) { process.exit(0); }
+});
+process.once("SIGTERM", function() { 
+  try { bot.stop("SIGTERM"); } catch(e) { process.exit(0); }
+});
+
+// ── 全自动赏金 Pipeline ────────────────────────────────────────────────────────
+
+const seenBounties = new Set(); // NOTE: resets on restart, bounties seen before restart will re-evaluate
+const PIPELINE_OWNER = process.env.PIPELINE_OWNER_ID;
+const PIPELINE_HOURS = process.env.PIPELINE_HOURS
+  ? process.env.PIPELINE_HOURS.split(",").map(function(h) { return parseInt(h.trim()); })
+  : null; // null = run anytime
+
+const PIPELINE_REGIONS = process.env.PIPELINE_REGIONS
+  ? process.env.PIPELINE_REGIONS.toLowerCase().split(",").map(function(r) { return r.trim(); })
+  : ["global", "全球", "worldwide", "international", "online", "remote"]; // your Telegram user ID
+const PIPELINE_ENABLED = process.env.PIPELINE_ENABLED === "true";
+
+// Scan Superteam bounties
+async function scanSuperteam() {
+  try {
+    const res = await fetch("https://earn.superteam.fun/api/listings/?type=bounty&status=open&take=20", {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    const data = await res.json();
+    const items = data.data || data.listings || data || [];
+    return items.map(function(b) {
+      return {
+        id: "superteam_" + (b.id || b.slug),
+        title: b.title || b.name,
+        url: "https://earn.superteam.fun/listings/" + (b.slug || b.id),
+        reward: b.rewardAmount || b.reward || 0,
+        currency: b.token || "USDC",
+        type: b.type || "bounty",
+        deadline: b.deadline,
+        description: b.description || b.shortDescription || "",
+        platform: "Superteam"
+      };
+    });
+  } catch (err) {
+    console.error("Superteam scan error:", err.message);
+    return [];
+  }
+}
+
+// Scan Immunefi bounties
+async function scanImmunefi() {
+  try {
+    const res = await fetch("https://immunefi.com/explore/", {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    const html = await res.text();
+    // Extract JSON from page
+    const match = html.match(/"props":(\{.*?"pageProps".*?\})\s*,\s*"page"/s);
+    if (!match) return [];
+    const props = JSON.parse(match[1]);
+    const bounties = props.pageProps && props.pageProps.bounties || [];
+    return bounties.slice(0, 20).map(function(b) {
+      return {
+        id: "immunefi_" + b.id,
+        title: b.project,
+        url: "https://immunefi.com/bounty/" + b.id,
+        reward: b.maxBounty || 0,
+        currency: "USD",
+        type: "audit",
+        description: b.description || "",
+        platform: "Immunefi"
+      };
+    });
+  } catch (err) {
+    console.error("Immunefi scan error:", err.message);
+    return [];
+  }
+}
+
+// Scan DoraHacks
+async function scanDoraHacks() {
+  try {
+    const res = await fetch("https://dorahacks.io/api/hackathon/?page=1&page_size=20&status=ongoing", {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": "https://dorahacks.io"
+      }
+    });
+    const text = await res.text();
+    if (text.trim().startsWith("<")) {
+      console.log("DoraHacks returned HTML, skipping");
+      return [];
+    }
+    const data = JSON.parse(text);
+    const items = data.data || data.results || [];
+    return items.map(function(b) {
+      return {
+        id: "dorahacks_" + b.id,
+        title: b.title || b.name,
+        url: "https://dorahacks.io/hackathon/" + b.id,
+        reward: b.total_prize || b.prize_pool || 0,
+        currency: "USD",
+        type: "hackathon",
+        deadline: b.end_time || b.deadline,
+        description: b.description || b.intro || "",
+        platform: "DoraHacks"
+      };
+    });
+  } catch (err) {
+    console.error("DoraHacks scan error:", err.message);
+    return [];
+  }
+}
+
+// Score bounty with Claude
+async function scoreBounty(bounty) {
+  try {
+    const prompt = "Score this bounty opportunity from 1-10 for someone who is a Crypto builder, content creator, and developer.\n\nBounty: " + bounty.title + "\nPlatform: " + bounty.platform + "\nType: " + bounty.type + "\nReward: " + bounty.reward + " " + bounty.currency + "\nDeadline: " + (bounty.deadline || "unknown") + "\nDescription: " + (bounty.description || "").substring(0, 500) + "\n\nScore criteria:\n- High reward = higher score\n- Content/dev tasks = higher score (we can automate)\n- Audit/security = medium score\n- Too technical without clear deliverable = lower score\n- Near deadline = lower score\n\nReply with ONLY a JSON object: {\"score\": 7, \"type\": \"content|dev|audit|hackathon\", \"reason\": \"brief reason\", \"deliverable\": \"what needs to be submitted\"}";
+
+    const res = await anthropic.messages.create({
+      model: FAST_MODEL,
+      max_tokens: 200,
+      messages: [{ role: "user", content: prompt }]
+    });
+    const text = (res.content[0] || {}).text || "{}";
+    const clean = text.replace(/```json\n?|```/g, "").trim();
+    return JSON.parse(clean);
+  } catch (err) {
+    return { score: 5, type: "unknown", reason: "Could not analyze", deliverable: "unknown" };
+  }
+}
+
+// Execute bounty based on type
+async function executeBounty(bounty, scoring, bot, chatId) {
+  try {
+    if (scoring.type === "content") {
+      await bot.telegram.sendMessage(chatId, "✍️ 开始生成内容类提交...");
+      // Fetch full bounty details
+      let fullDesc = bounty.description;
+      try {
+        const pageRes = await fetch(bounty.url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const html = await pageRes.text();
+        const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 4000);
+        fullDesc = text;
+      } catch (e) {}
+
+      const contentRes = await anthropic.messages.create({
+        model: MAIN_MODEL,
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "Write a complete submission for this bounty:\n\nBounty: " + bounty.title + "\nDeliverable: " + scoring.deliverable + "\nDetails: " + fullDesc.substring(0, 2000) + "\n\nWrite in a professional, engaging style. Make it submission-ready." }]
+      });
+      const content = (contentRes.content[0] || {}).text || "";
+      const buf = Buffer.from("BOUNTY: " + bounty.title + "\nURL: " + bounty.url + "\n\n" + content, "utf-8");
+      await bot.telegram.sendDocument(chatId, { source: buf, filename: "submission_" + bounty.platform + ".txt" }, { caption: "📄 内容已生成，去这里提交: " + bounty.url });
+
+    } else if (scoring.type === "dev" || scoring.type === "hackathon") {
+      await bot.telegram.sendMessage(chatId, "💻 开发类任务 — 用 /vibe 生成项目：\n\n发送: /vibe\n然后描述: " + bounty.title + "\n\n或直接告诉我开始，我帮你生成。");
+
+    } else if (scoring.type === "audit") {
+      await bot.telegram.sendMessage(chatId, "🔍 开始代码审计分析...");
+      // Try to find code repo from bounty page
+      let codeUrl = bounty.url;
+      const auditRes = await anthropic.messages.create({
+        model: MAIN_MODEL,
+        max_tokens: 4096,
+        messages: [{ role: "user", content: "Write a professional security audit report outline for:\n\nProject: " + bounty.title + "\nBounty URL: " + bounty.url + "\nDescription: " + bounty.description.substring(0, 1000) + "\n\nInclude: Executive Summary, Scope, Methodology, Common Vulnerability Areas to Check (reentrancy, access control, integer overflow, etc), Risk Assessment Framework, and Reporting Template. Make it ready to use for an actual audit." }]
+      });
+      const report = (auditRes.content[0] || {}).text || "";
+      const buf = Buffer.from("AUDIT REPORT: " + bounty.title + "\nSource: " + bounty.url + "\n\n" + report, "utf-8");
+      await bot.telegram.sendDocument(chatId, { source: buf, filename: "audit_" + bounty.platform + ".txt" }, { caption: "🔍 审计报告模板已生成。提交至: " + bounty.url });
+    }
+  } catch (err) {
+    console.error("Execute bounty error:", err.message);
+    await bot.telegram.sendMessage(chatId, "执行失败: " + err.message);
+  }
+}
+
+// Main pipeline function
+async function runBountyPipeline(bot) {
+  if (!PIPELINE_ENABLED || !PIPELINE_OWNER) return;
+
+  // Check if current hour is allowed
+  if (PIPELINE_HOURS) {
+    const currentHour = new Date().getUTCHours() + 8; // UTC+8 Malaysia time
+    const localHour = currentHour % 24;
+    if (!PIPELINE_HOURS.includes(localHour)) {
+      console.log("Pipeline skipped - not in allowed hours (current: " + localHour + ":00, allowed: " + PIPELINE_HOURS.join(",") + ")");
+      return;
+    }
+  }
+
+  console.log("Running bounty pipeline...");
+
+  try {
+    // Scan all platforms
+    const [superteam, immunefi, dorahacks] = await Promise.all([
+      scanSuperteam(),
+      scanImmunefi(),
+      scanDoraHacks()
+    ]);
+
+    const allBounties = [...superteam, ...immunefi, ...dorahacks];
+    const newBounties = allBounties.filter(function(b) { return !seenBounties.has(b.id); });
+
+    if (newBounties.length === 0) {
+      console.log("No new bounties found");
+      return;
+    }
+
+    console.log("Found " + newBounties.length + " new bounties, scoring top 5...");
+
+    // Mark all as seen first to avoid reprocessing
+    newBounties.forEach(function(b) { seenBounties.add(b.id); });
+
+    // Filter by region if set
+    const regionFiltered = newBounties.filter(function(b) {
+      if (!b.description) return true;
+      const desc = b.description.toLowerCase();
+      return PIPELINE_REGIONS.some(function(r) { return desc.includes(r); });
+    });
+
+    // Only score top 5 by reward amount
+    const toScore = (regionFiltered.length > 0 ? regionFiltered : newBounties).slice(0, 5);
+    const scored = [];
+    for (const bounty of toScore) {
+      const scoring = await scoreBounty(bounty);
+      if (scoring.score >= 7) {
+        scored.push({ bounty, scoring });
+      }
+    }
+
+    if (scored.length === 0) {
+      console.log("No high-score bounties found");
+      return;
+    }
+
+    // Notify and execute top bounties
+    const chatId = parseInt(PIPELINE_OWNER);
+    await bot.telegram.sendMessage(chatId, "🤖 Pipeline 发现 " + scored.length + " 个高分赏金！");
+
+    for (const { bounty, scoring } of scored.slice(0, 3)) {
+      await bot.telegram.sendMessage(chatId,
+        "⭐ " + scoring.score + "/10 — " + bounty.title + "\n" +
+        "📦 平台: " + bounty.platform + "\n" +
+        "💰 奖励: " + bounty.reward + " " + bounty.currency + "\n" +
+        "📋 类型: " + scoring.type + "\n" +
+        "🎯 需要: " + scoring.deliverable + "\n" +
+        "💡 " + scoring.reason + "\n" +
+        "🔗 " + bounty.url
+      );
+
+      // Auto-execute
+      await executeBounty(bounty, scoring, bot, chatId);
+      // Wait 3 minutes between each bounty to avoid overload
+      const BETWEEN_BOUNTIES_MS = parseInt(process.env.PIPELINE_DELAY_MINS || "3") * 60 * 1000;
+      console.log("Waiting " + (BETWEEN_BOUNTIES_MS/60000) + " mins before next bounty...");
+      await new Promise(function(r) { setTimeout(r, BETWEEN_BOUNTIES_MS); });
+    }
+
+  } catch (err) {
+    console.error("Pipeline error:", err.message);
+    // If rate limited, wait and the next scheduled run will handle it
+    if (err.message && err.message.includes("429")) {
+      console.log("Rate limited by Telegram, will retry next cycle");
+    }
+  }
+}
+
+// Manual trigger command
+bot.command("pipeline", async function(ctx) {
+  const userId = ctx.from.id;
+  if (!PIPELINE_ENABLED) {
+    return ctx.reply("Pipeline 未启用。在 Railway Variables 添加：\nPIPELINE_ENABLED=true\nPIPELINE_OWNER_ID=" + userId);
+  }
+  await ctx.reply("🤖 手动触发 Pipeline 扫描...");
+  runBountyPipeline(bot);
+});
+
+bot.command("pipelinestatus", async function(ctx) {
+  const userId = ctx.from.id;
+  await ctx.reply(
+    "Pipeline 状态:\n" +
+    "启用: " + (PIPELINE_ENABLED ? "✅" : "❌") + "\n" +
+    "你的 ID: " + userId + "\n" +
+    "Owner ID: " + (PIPELINE_OWNER || "未设置") + "\n" +
+    "已追踪赏金: " + seenBounties.size + " 个\n\n" +
+    "要启用自动运行，在 Railway Variables 添加:\n" +
+    "PIPELINE_ENABLED=true\n" +
+    "PIPELINE_OWNER_ID=" + userId
+  );
+});
+
+// Start auto pipeline if enabled (every 30 minutes)
+setTimeout(function() {
+  if (PIPELINE_ENABLED && PIPELINE_OWNER) {
+    console.log("Auto pipeline started, running every 30 minutes");
+    runBountyPipeline(bot);
+    setInterval(function() { runBountyPipeline(bot); }, 30 * 60 * 1000);
+  }
+}, 60000); // wait 60s after startup to avoid 429
+
