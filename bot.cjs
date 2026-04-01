@@ -322,6 +322,47 @@ async function searchMemories(userId, query) {
 }
 
 // ── 自动学习 ──────────────────────────────────────────────────────────────────
+
+// ── autoDream: 后台记忆整理系统 ────────────────────────────────────────────────
+async function autoDream(userId) {
+  try {
+    const docs = await getAllDocs(userId);
+    if (!docs.notes && !docs.soul && !docs.projects) return;
+
+    const combined = [
+      docs.soul ? "SOUL:\n" + docs.soul : "",
+      docs.projects ? "PROJECTS:\n" + docs.projects : "",
+      docs.tasks ? "TASKS:\n" + docs.tasks : "",
+      docs.notes ? "NOTES:\n" + docs.notes : ""
+    ].filter(Boolean).join("\n\n");
+
+    if (combined.length < 200) return; // Not enough to consolidate
+
+    const res = await anthropic.messages.create({
+      model: FAST_MODEL, max_tokens: 2000,
+      messages: [{ role: "user", content: "Clean up and consolidate this user memory. Rules:\n1. Remove duplicates\n2. Remove contradictions (keep latest)\n3. Remove info that can be inferred (e.g. dont store 'user uses Railway' if already in soul)\n4. Keep ONLY facts, decisions, and preferences\n5. Be ruthlessly concise\n\nMemory:\n" + combined + "\n\nReturn ONLY the cleaned version in same format (SOUL:, PROJECTS:, TASKS:, NOTES: sections). If a section has nothing useful, return empty string for it." }]
+    });
+
+    const cleaned = (res.content[0] || {}).text || "";
+    if (cleaned.length < 50) return;
+
+    // Parse and save back
+    const soulMatch = cleaned.match(/SOUL:\n([\s\S]*?)(?=\n(?:PROJECTS|TASKS|NOTES):|$)/);
+    const projMatch = cleaned.match(/PROJECTS:\n([\s\S]*?)(?=\n(?:SOUL|TASKS|NOTES):|$)/);
+    const taskMatch = cleaned.match(/TASKS:\n([\s\S]*?)(?=\n(?:SOUL|PROJECTS|NOTES):|$)/);
+    const noteMatch = cleaned.match(/NOTES:\n([\s\S]*?)(?=\n(?:SOUL|PROJECTS|TASKS):|$)/);
+
+    if (soulMatch && soulMatch[1].trim()) await setDoc(userId, "soul", soulMatch[1].trim());
+    if (projMatch && projMatch[1].trim()) await setDoc(userId, "projects", projMatch[1].trim());
+    if (taskMatch && taskMatch[1].trim()) await setDoc(userId, "tasks", taskMatch[1].trim());
+    if (noteMatch && noteMatch[1].trim()) await setDoc(userId, "notes", noteMatch[1].trim());
+
+    console.log("autoDream completed for user:", userId);
+  } catch (err) {
+    console.error("autoDream error:", err.message);
+  }
+}
+
 async function autoLearnMemory(userId, userMessage, aiReply) {
   // Quick check: is this conversation worth learning from?
   try {
@@ -590,14 +631,18 @@ async function askClaude(userId, userMessage, ctx) {
   }
 
   // Save truncated version to history if reply is code-heavy (saves space)
-  const hasCode = reply.includes("```") || reply.includes("def ") || reply.includes("function ");
-  const toSave = (hasCode && reply.length > 1000)
-    ? "[代码回复，" + reply.length + " 字符] " + reply.substring(0, 200) + "..."
+  const hasCode = reply.includes("```") || reply.includes("def ") || reply.includes("async function") || reply.includes("import ");
+  const isLongAnalysis = reply.length > 2000 && !hasCode;
+  const toSave = hasCode && reply.length > 500
+    ? "[代码回复 " + reply.length + "字] " + reply.substring(0, 150) + "..."
+    : isLongAnalysis
+    ? reply.substring(0, 500) + "...[已截断]"
     : reply;
   await saveMessage(userId, "assistant", toSave);
   countMessages(userId).then(function(count) {
     const tasks = [maybeAutoSummarize(userId)];
     if (count % 5 === 0) tasks.push(autoLearnMemory(userId, userMessage, reply));
+    if (count % 10 === 0) tasks.push(autoDream(userId));
     return Promise.all(tasks);
   }).catch(function(err) { console.error("Background error:", err.message); });
 
@@ -838,11 +883,45 @@ async function pushFilesToGitHub(owner, repoName, files) {
 }
 
 async function generateProjectFiles(idea, techStack, details) {
-  const prompt = "You are an expert developer. Generate a complete, production-ready project.\n\nPROJECT IDEA: " + idea + "\nTECH STACK: " + techStack + "\nADDITIONAL DETAILS: " + (details || "none") + "\n\nReturn a JSON object where keys are file paths and values are file contents. Include ALL necessary files: main code, package.json or requirements.txt, README.md, .gitignore, and config files. Make the code complete and runnable - no placeholders.\n\nReturn ONLY valid JSON, no explanation, no markdown backticks.";
-  const res = await anthropic.messages.create({ model: MAIN_MODEL, max_tokens: 4096, messages: [{ role: "user", content: prompt }] });
-  const text = (res.content[0] || {}).text || "{}";
-  const clean = text.replace(/^```json\n?|^```\n?|```$/gm, "").trim();
-  return JSON.parse(clean);
+  // Strategy: generate files one by one, no JSON format (avoids truncation issues)
+  const isPython = techStack.toLowerCase().includes("python");
+  const mainFile = isPython ? "main.py" : (techStack.toLowerCase().includes("node") ? "index.js" : "main.py");
+  const depFile = isPython ? "requirements.txt" : "package.json";
+
+  const files = {};
+
+  // Generate main file - 2 pass for completeness
+  const sysPrompt = "You are an expert developer. Write complete, production-ready code. No placeholders, no TODOs. Always write the full implementation.";
+  
+  const res1 = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 8192, system: sysPrompt,
+    messages: [{ role: "user", content: "Write the FIRST HALF of " + mainFile + " for: " + idea + "\nTech: " + techStack + "\nDetails: " + (details || "none") + "\n\nOutput ONLY the code, no markdown. End with: # === PART 2 CONTINUES ===" }]
+  });
+  const part1 = ((res1.content[0] || {}).text || "").replace(/```[\w]*\n?|```/g, "").trim();
+
+  const res2 = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 8192, system: sysPrompt,
+    messages: [
+      { role: "user", content: "Write " + mainFile + " for: " + idea },
+      { role: "assistant", content: part1 },
+      { role: "user", content: "Continue writing the SECOND HALF. Include main loop, error handling, entry point. Output ONLY code." }
+    ]
+  });
+  const part2 = ((res2.content[0] || {}).text || "").replace(/```[\w]*\n?|```/g, "").trim();
+  files[mainFile] = part1 + "\n\n" + part2;
+
+  // Generate dependencies file
+  const depRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 500,
+    messages: [{ role: "user", content: "List only the pip packages needed for this code (one per line, no versions needed):\n" + part1.substring(0, 2000) + "\n\nOutput ONLY package names, one per line." }]
+  });
+  files[depFile] = ((depRes.content[0] || {}).text || "").trim();
+
+  // Simple README
+  files["README.md"] = "# " + idea + "\n\nTech: " + techStack + "\n\nGenerated by Claude 大神";
+  files[".gitignore"] = isPython ? "__pycache__/\n*.pyc\n.env\nvenv/" : "node_modules/\n.env";
+
+  return files;
 }
 
 async function reviewAndFixFiles(files, idea, techStack) {
@@ -881,6 +960,18 @@ bot.command("vibestop", async function(ctx) {
   await ctx.reply("已退出 Vibe Coding 模式。");
 });
 
+
+// Store pending fix tasks
+const pendingFix = new Map();
+// Auto-expire pendingFix after 10 minutes
+setInterval(function() {
+  const now = Date.now();
+  pendingFix.forEach(function(val, key) {
+    if (val.createdAt && now - val.createdAt > 10 * 60 * 1000) {
+      pendingFix.delete(key);
+    }
+  });
+}, 60000);
 
 // ── 决策学习系统 ────────────────────────────────────────────────────────────────
 async function recordDecision(userId, bountyInfo, decision) {
@@ -1020,218 +1111,6 @@ bot.command("load", async function(ctx) {
 });
 
 
-// Code mode state
-const codeSessions = new Map();
-
-bot.command("code", async function(ctx) {
-  const userId = ctx.from.id;
-  const args = ctx.message.text.split(" ").slice(1).join(" ").trim();
-
-  if (!args) {
-    codeSessions.set(userId, { active: true, task: null });
-    return ctx.reply("💻 进入 Code 模式\n\n说说你要生成什么代码？");
-  }
-
-  codeSessions.set(userId, { active: true, task: args });
-  await ctx.reply("💻 Code 模式\n任务：" + args + "\n\n分段生成中，请稍等...");
-
-  setImmediate(async function() {
-    try {
-      await ctx.sendChatAction("typing");
-
-      // Direct generation - no outline step (outline causes hallucination)
-      // Split into 2 passes: first half, second half, then combine
-      await ctx.reply("⚙️ [1/2] 生成前半部分...");
-      const res1 = await anthropic.messages.create({
-        model: MAIN_MODEL, max_tokens: 8192,
-        system: "You are an expert programmer. Write EXACTLY what is asked. Do not invent generic modules. Write specific, working code for the exact task described.",
-        messages: [{ role: "user", content: "Write the FIRST HALF of complete Python code for: " + args + "\n\nInclude: imports, configuration, and main classes/functions (first half only). End with a comment '# === CONTINUED IN PART 2 ===' at the bottom. No markdown." }]
-      });
-      const part1 = ((res1.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
-
-      await ctx.reply("⚙️ [2/2] 生成后半部分...");
-      await ctx.sendChatAction("typing");
-      const res2 = await anthropic.messages.create({
-        model: MAIN_MODEL, max_tokens: 8192,
-        system: "You are an expert programmer. Continue writing the second half of the code.",
-        messages: [
-          { role: "user", content: "Write the FIRST HALF of complete Python code for: " + args },
-          { role: "assistant", content: part1 },
-          { role: "user", content: "Now write the SECOND HALF - continue from where you left off. Include: remaining functions, main loop, error handling, and entry point (if __name__ == '__main__'). No markdown, just code." }
-        ]
-      });
-      const part2 = ((res2.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
-
-      const fullCode = part1 + "\n\n" + part2;
-      await ctx.reply("🔗 合并完成...");
-
-      const buf = Buffer.from(fullCode, "utf-8");
-      const ts = new Date().toISOString().slice(11,16).replace(":","");
-      await ctx.replyWithDocument(
-        { source: buf, filename: "code_" + ts + ".txt" },
-        { caption: "✅ 完整代码\n\n用 /save [版本名] 保存" }
-      );
-
-    } catch (err) {
-      console.error("Code gen error:", err.message);
-      await ctx.reply("生成失败: " + err.message).catch(function(){});
-    }
-  });
-});
-
-
-// Store pending fix tasks (file content + instructions)
-const pendingFix = new Map();
-// Auto-expire pendingFix after 10 minutes
-setInterval(function() {
-  const now = Date.now();
-  pendingFix.forEach(function(val, key) {
-    if (val.createdAt && now - val.createdAt > 10 * 60 * 1000) {
-      pendingFix.delete(key);
-      console.log("pendingFix expired for user:", key);
-    }
-  });
-}, 60000);
-
-bot.command("fix", async function(ctx) {
-  const userId = ctx.from.id;
-  const firstLine = ctx.message.text.split("\n")[0];
-  const instructions = firstLine.split(" ").slice(1).join(" ").trim();
-  
-  if (!instructions) {
-    // No instructions yet - wait for user to type them, NOT ready for file
-    pendingFix.set(userId, { waiting: false, instructions: null, createdAt: Date.now() });
-    return ctx.reply("🔧 Fix 模式\n\n要修什么？（直接打说明）");
-  }
-  
-  // Has instructions - now ready for file
-  pendingFix.set(userId, { waiting: true, instructions, createdAt: Date.now() });
-  await ctx.reply("🔧 Fix 模式 — " + instructions + "\n\n发 .py 文件给我 👇");
-});
-
-
-async function autoAnalyzeAndFix(ctx, userId, fileName, fileText) {
-  await ctx.reply("🔍 自动分析 " + fileName + "（" + fileText.length + " 字符）...\n\n找 bug、优化点和潜在问题");
-  await ctx.sendChatAction("typing");
-
-  setImmediate(async function() {
-    try {
-      const CHUNK = 20000;
-      const sample = fileText.length > CHUNK
-        ? fileText.substring(0, CHUNK) + "\n...[文件过长，显示前 " + CHUNK + " 字符]"
-        : fileText;
-
-      // Step 1: Analyze
-      const analysisRes = await anthropic.messages.create({
-        model: MAIN_MODEL, max_tokens: 2000,
-        system: "You are a senior Python code reviewer. Analyze code and find real issues.",
-        messages: [{ role: "user", content: "Analyze this Python file and find:\n1. Bugs and errors\n2. Missing features\n3. Risk areas\n4. Optimization opportunities\n\nFile: " + fileName + "\n\n" + sample + "\n\nProvide a clear, actionable analysis in Chinese. Be specific about line numbers or function names when possible." }]
-      });
-      const analysis = (analysisRes.content[0] || {}).text || "";
-      await sendLongMessage(ctx, "📊 **" + fileName + " 分析报告**\n\n" + analysis);
-
-      // Step 2: Ask if they want fixes
-      await ctx.reply("要我生成修复版吗？\n\n直接回复 '修复' 或告诉我要修哪些问题");
-      pendingFix.set(userId, { waiting: true, instructions: "__auto__", originalCode: fileText, fileName, createdAt: Date.now() });
-
-    } catch (err) {
-      console.error("Auto analyze error:", err.message);
-      await ctx.reply("分析失败: " + err.message).catch(function(){});
-    }
-  });
-}
-
-async function processFileFix(ctx, userId, fileName, fileText, instructions) {
-  await ctx.reply("📖 读取完毕（" + fileText.length + " 字符）\n⚙️ 开始修改，请稍等...");
-
-  const CHUNK = 25000;
-  
-  setImmediate(async function() {
-    try {
-      let fullCode = "";
-      
-      if (fileText.length <= CHUNK) {
-        // 2-pass output to avoid truncation
-        const sysPrompt = "You are an expert Python programmer. Fix/modify code as instructed. Output ONLY Python code, no explanations, no markdown.";
-        const userMsg = "File: " + fileName + "\n\nInstructions: " + instructions + "\n\nOriginal code:\n" + fileText;
-
-        const res1 = await anthropic.messages.create({
-          model: MAIN_MODEL, max_tokens: 8192, system: sysPrompt,
-          messages: [{ role: "user", content: userMsg + "\n\nOutput the FIRST HALF of the complete modified code. End with comment: # === PART 2 CONTINUES ===" }]
-        });
-        const part1 = ((res1.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
-
-        await ctx.reply("⚙️ 生成后半部分...");
-        await ctx.sendChatAction("typing");
-
-        const res2 = await anthropic.messages.create({
-          model: MAIN_MODEL, max_tokens: 8192, system: sysPrompt,
-          messages: [
-            { role: "user", content: userMsg },
-            { role: "assistant", content: part1 },
-            { role: "user", content: "Continue and output the SECOND HALF of the modified code. Start from where you left off." }
-          ]
-        });
-        const part2 = ((res2.content[0] || {}).text || "").replace(/```python\n?|```/g, "").trim();
-        fullCode = part1 + "\n" + part2;
-      } else {
-        // Large file - process in chunks, then merge
-        const chunks = [];
-        for (let i = 0; i < fileText.length; i += CHUNK) {
-          chunks.push(fileText.substring(i, i + CHUNK));
-        }
-        
-        await ctx.reply("📦 文件较大，分 " + chunks.length + " 段处理...");
-        
-        // First pass: understand the full structure
-        const structRes = await anthropic.messages.create({
-          model: FAST_MODEL, max_tokens: 1000,
-          system: "Analyze code structure briefly.",
-          messages: [{ role: "user", content: "List the main functions/classes in this code (first " + CHUNK + " chars):\n" + chunks[0] }]
-        });
-        const structure = (structRes.content[0] || {}).text || "";
-        
-        // Fix each chunk
-        const fixedChunks = [];
-        for (let i = 0; i < chunks.length; i++) {
-          await ctx.reply("⚙️ [" + (i+1) + "/" + chunks.length + "] 修改中...");
-          await ctx.sendChatAction("typing");
-          const res = await anthropic.messages.create({
-            model: MAIN_MODEL, max_tokens: 8192,
-            system: "You are fixing part " + (i+1) + " of " + chunks.length + " of a Python file. Apply the fix instructions only where relevant in this section. Output ONLY the code for this section, no explanations.",
-            messages: [{ role: "user", content: "File: " + fileName + "\nFull structure: " + structure + "\n\nFix instructions: " + instructions + "\n\nThis section (part " + (i+1) + "/" + chunks.length + "):\n" + chunks[i] + "\n\nOutput fixed code for this section:" }]
-          });
-          fixedChunks.push((res.content[0] || {}).text || chunks[i]);
-        }
-        fullCode = fixedChunks.join("\n");
-      }
-      
-      // Clean up and send
-      fullCode = fullCode.replace(/^```python\n?|^```\n?|```$/gm, "").trim();
-      const buf = Buffer.from(fullCode, "utf-8");
-      const ts = new Date().toISOString().slice(11,16).replace(":","");
-      const outName = fileName.replace(".py", "_fixed_" + ts + ".py");
-      
-      await withRetry(function() {
-        return ctx.replyWithDocument(
-          { source: buf, filename: outName },
-          { caption: "✅ 修改完成！\n\n用 /save [版本名] 保存" }
-        );
-      });
-      pendingFix.delete(userId);
-      
-    } catch (err) {
-      console.error("Fix error:", err.message);
-      await ctx.reply("修改失败: " + err.message).catch(function(){});
-      pendingFix.delete(userId);
-    }
-  });
-}
-
-bot.command("codestop", async function(ctx) {
-  codeSessions.delete(ctx.from.id);
-  await ctx.reply("已退出 Code 模式。");
-});
 
 bot.command("memory", async function(ctx) {
   await ctx.sendChatAction("typing");
@@ -1492,17 +1371,18 @@ bot.on("text", async function(ctx) {
     }
   }
 
-  // Learn from user decisions (skip/do on bounties)
-  if (!userMessage.startsWith("/")) {
+  // Learn from user decisions (only for short bounty responses)
+  const isBountyDecision = !userMessage.startsWith("/") && 
+    userMessage.length < 50 &&
+    (userMessage.includes("做") || userMessage.includes("跳过") || 
+     userMessage.includes("skip") || userMessage.includes("pass") ||
+     userMessage.toLowerCase() === "yes" || userMessage.toLowerCase() === "no" ||
+     userMessage.includes("要") || userMessage.includes("不要"));
+  if (isBountyDecision) {
     learnFromDecision(userId, userMessage).catch(function(e) {});
   }
 
-  // Warn if history is getting very long
-  const historyCheck = await getHistory(userId);
-  const totalHistoryChars = historyCheck.reduce(function(sum, m) { return sum + (m.content || "").length; }, 0);
-  if (totalHistoryChars > 30000 && !userMessage.startsWith("/")) {
-    await ctx.reply("⚠️ 对话历史很长，可能影响回复速度。建议发 /forget 清理历史（记忆档案不会丢失）。").catch(function(){});
-  }
+
 
   // Handle vibe coding session
   if (vibeSessions.has(userId) && !userMessage.startsWith("/")) {
@@ -1554,10 +1434,21 @@ bot.on("text", async function(ctx) {
         const repoName = session.idea.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim().split(/\s+/).slice(0, 4).join("-") + "-" + Date.now().toString().slice(-4);
 
         await createGitHubRepo(repoName, session.idea);
-        const repoUrl = await pushFilesToGitHub(owner, repoName, reviewedFiles);
+        // Filter out empty files
+        const validFiles = {};
+        Object.entries(reviewedFiles).forEach(function(entry) {
+          if (entry[1] && entry[1].trim().length > 10) validFiles[entry[0]] = entry[1];
+        });
+
+        if (Object.keys(validFiles).length === 0) {
+          vibeSessions.delete(userId);
+          return ctx.reply("生成的文件内容为空，请重新 /vibe 再试。");
+        }
+
+        const repoUrl = await pushFilesToGitHub(owner, repoName, validFiles);
         vibeSessions.delete(userId);
 
-        const fileList = Object.keys(reviewedFiles).map(function(f) { return "- " + f; }).join("\n");
+        const fileList = Object.keys(validFiles).map(function(f) { return "- " + f; }).join("\n");
         await ctx.reply("🎉 完成！\n\n📦 GitHub: " + repoUrl + "\n\n文件:\n" + fileList + "\n\n下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 部署完成 ✅");
       } catch (err) {
         console.error("Vibe error:", err.message);
@@ -1668,6 +1559,8 @@ bot.on("text", async function(ctx) {
 
 // ── 处理图片 ──────────────────────────────────────────────────────────────────
 bot.on("photo", async function(ctx) {
+  // Skip photos that are part of a media group (multiple photos sent at once)
+  if (ctx.message.media_group_id) return;
   const userId = ctx.from.id;
   await ctx.sendChatAction("typing");
   try {
@@ -1925,8 +1818,6 @@ bot.telegram.setMyCommands([
   { command: "settasks", description: "✏️ 更新任务" },
   { command: "imagine", description: "🎨 AI 图片生成 /imagine [描述]" },
   { command: "fix", description: "🔧 修改现有代码文件" },
-  { command: "code", description: "💻 生成完整代码文件（任何语言）" },
-  { command: "codestop", description: "⏹ 退出 Code 模式" },
   { command: "save", description: "💾 保存代码版本 /save v11" },
   { command: "versions", description: "📦 查看所有保存版本" },
   { command: "load", description: "📂 加载代码版本 /load v11" },
@@ -2142,34 +2033,100 @@ async function scanSuperteam() {
   }
 }
 
-// Scan Immunefi bounties
+
+
+
+// Scan GitHub Bounties
+async function scanGitHub() {
+  try {
+    const res = await fetch("https://api.github.com/search/issues?q=label:bounty+state:open&sort=created&per_page=20", {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/vnd.github.v3+json" }
+    });
+    const data = await res.json();
+    const items = data.items || [];
+    return items.map(function(b) {
+      return {
+        id: "github_" + b.id,
+        title: b.title,
+        url: b.html_url,
+        reward: 0, currency: "USD", type: "dev",
+        deadline: null,
+        description: b.body ? b.body.substring(0, 300) : "",
+        platform: "GitHub"
+      };
+    });
+  } catch (err) { console.error("GitHub scan error:", err.message); return []; }
+}
+
+// Scan HackQuest
+async function scanHackQuest() {
+  try {
+    const res = await fetch("https://www.hackquest.io/api/hackathon/list?page=1&limit=20&status=ongoing", {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+    });
+    const text = await res.text();
+    if (text.trim().startsWith("<")) return [];
+    const data = JSON.parse(text);
+    const items = data.data || data.list || data.hackathons || [];
+    return items.map(function(b) {
+      return {
+        id: "hackquest_" + (b.id || b.alias),
+        title: b.name || b.title,
+        url: "https://www.hackquest.io/en/hackathon/" + (b.alias || b.id),
+        reward: b.totalPrize || b.prize || 0, currency: "USD", type: "hackathon",
+        deadline: b.endTime || b.end_time,
+        description: b.description || b.intro || "",
+        platform: "HackQuest"
+      };
+    });
+  } catch (err) { console.error("HackQuest scan error:", err.message); return []; }
+}
+
+// Scan Devpost
+async function scanDevpost() {
+  try {
+    const res = await fetch("https://devpost.com/api/hackathons?status=open&order_by=prize-amount&per_page=20", {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+    });
+    const data = await res.json();
+    const items = data.hackathons || [];
+    return items.map(function(b) {
+      return {
+        id: "devpost_" + b.id,
+        title: b.title,
+        url: b.url,
+        reward: b.prize_amount || 0, currency: "USD", type: "hackathon",
+        deadline: b.submission_period_dates,
+        description: b.tagline || "",
+        platform: "Devpost"
+      };
+    });
+  } catch (err) { console.error("Devpost scan error:", err.message); return []; }
+}
+
+// Scan Immunefi
 async function scanImmunefi() {
   try {
-    const res = await fetch("https://immunefi.com/explore/", {
+    const res = await fetch("https://immunefi.com/explore/?filter=bounty", {
       headers: { "User-Agent": "Mozilla/5.0" }
     });
-    const html = await res.text();
-    // Extract JSON from page
-    const match = html.match(/"props":(\{.*?"pageProps".*?\})\s*,\s*"page"/s);
+    const text = await res.text();
+    const match = text.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
     if (!match) return [];
-    const props = JSON.parse(match[1]);
-    const bounties = props.pageProps && props.pageProps.bounties || [];
+    const data = JSON.parse(match[1]);
+    const bounties = data.props?.pageProps?.bounties || [];
     return bounties.slice(0, 20).map(function(b) {
       return {
         id: "immunefi_" + b.id,
         title: b.project,
         url: "https://immunefi.com/bounty/" + b.id,
-        reward: b.maxBounty || 0,
-        currency: "USD",
-        type: "audit",
+        reward: b.maximumReward || 0, currency: "USD", type: "audit",
+        deadline: null,
         description: b.description || "",
         platform: "Immunefi"
       };
     });
-  } catch (err) {
-    console.error("Immunefi scan error:", err.message);
-    return [];
-  }
+  } catch (err) { console.error("Immunefi scan error:", err.message); return []; }
 }
 
 // Scan DoraHacks
@@ -2289,13 +2246,16 @@ async function runBountyPipeline(bot) {
 
   try {
     // Scan all platforms
-    const [superteam, immunefi, dorahacks] = await Promise.all([
+    const [superteam, dorahacks, github, hackquest, devpost, immunefi] = await Promise.all([
       scanSuperteam(),
-      scanImmunefi(),
-      scanDoraHacks()
+      scanDoraHacks(),
+      scanGitHub(),
+      scanHackQuest(),
+      scanDevpost(),
+      scanImmunefi()
     ]);
 
-    const allBounties = [...superteam, ...immunefi, ...dorahacks];
+    const allBounties = [...superteam, ...dorahacks, ...github, ...hackquest, ...devpost, ...immunefi];
     const newBounties = allBounties.filter(function(b) { return !seenBounties.has(b.id); });
 
     if (newBounties.length === 0) {
