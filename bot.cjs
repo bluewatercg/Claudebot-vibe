@@ -13,6 +13,8 @@ const VOYAGE_API_KEY = process.env.VOYAGE_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const RAILWAY_API_TOKEN = process.env.RAILWAY_API_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const SLITHER_API_URL = process.env.SLITHER_API_URL;
+const SLITHER_API_KEY = process.env.SLITHER_API_KEY;
 const MAIN_MODEL = process.env.AI_MODEL || "claude-opus-4-5";
 const FAST_MODEL = process.env.AI_FAST_MODEL || "claude-haiku-4-5-20251001";
 const PORT = process.env.PORT || 3000;
@@ -44,8 +46,7 @@ const docsStore = new Map();
 const summaryStore = new Map();
 const vectorStore = new Map();
 const processingLock = new Map(); // prevent concurrent processing per user
-const mediaGroupCache = new Map(); // cache files from same media group
-const streamedReplies = new Set(); // track replies already shown via streaming
+const streamedReplies = new Set();
 const MEDIA_GROUP_WAIT_MS = 1500; // wait 1.5s to collect all files in group
 const docsCache = new Map(); // cache docs for 60 seconds
 const CACHE_TTL = 60000;
@@ -113,8 +114,8 @@ async function saveMessage(userId, role, content) {
         .order("created_at", { ascending: false })
         .range(RECENT_MESSAGES, RECENT_MESSAGES + 100);
       if (oldMsgs && oldMsgs.length > 0) {
-        const ids = oldMsgs.map(function(r) { return r.id; });
-        await supabase.from("conversations").delete().in("id", ids);
+        const ids = oldMsgs.map(function(r) { return r.id; }).filter(Boolean);
+        if (ids.length > 0) await supabase.from("conversations").delete().in("id", ids);
       }
       return;
     } catch (err) { console.error("saveMessage error:", err.message); }
@@ -286,23 +287,43 @@ async function searchMemories(userId, query) {
 
   if (supabase) {
     try {
-      // 用原始 SQL 查询代替 RPC 函数，更可靠
-      const embeddingStr = JSON.stringify(queryEmbedding);
+      // Try pgvector RPC first (database-side similarity search)
+      const { data: rpcData, error: rpcError } = await supabase.rpc("search_memories", {
+        query_embedding: queryEmbedding,
+        match_user_id: userId,
+        match_count: TOP_MEMORIES
+      });
+      if (!rpcError && rpcData && rpcData.length > 0) {
+        return rpcData.map(function(d) { return d.content; });
+      }
+      // Fallback: fetch all + local cosine sort
       const { data, error } = await supabase
         .from("memories")
-        .select("content")
+        .select("content, embedding")
         .eq("user_id", userId)
-        .limit(TOP_MEMORIES);
+        .limit(200);
       if (error) throw error;
-      return (data || []).map(function(d) { return d.content; });
+      if (!data || data.length === 0) return [];
+
+      return data
+        .map(function(d) {
+          let emb = d.embedding;
+          if (typeof emb === "string") try { emb = JSON.parse(emb); } catch(e) { emb = null; }
+          const score = Array.isArray(emb) ? cosine(queryEmbedding, emb) : 0;
+          return { content: d.content, score };
+        })
+        .sort(function(a, b) { return b.score - a.score; })
+        .slice(0, TOP_MEMORIES)
+        .map(function(d) { return d.content; });
     } catch (err) {
       console.error("searchMemories error:", err.message);
       return [];
     }
   }
 
-  // 内存 fallback
-  const memories = vectorStore.get(userId) || [];
+  // 内存 fallback — limit to 100 to avoid blocking event loop
+  const allMems = vectorStore.get(userId) || [];
+  const memories = allMems.slice(-100); // keep most recent 100
   if (memories.length === 0) return [];
 
   function cosine(a, b) {
@@ -667,13 +688,13 @@ async function askClaude(userId, userMessage, ctx) {
     /完整|complete|给我.*代码|写.*完整|v\d+|修复版|整个.*代码|不.*完整|继续|要$/.test(lastMsgContent);
 
   if (isCodeRequest) {
-    if (ctx) { try { await ctx.reply("💻 代码生成中，自动合并为完整文件..."); } catch(e) {} }
+    if (ctx) { try { await ctx.reply("💻 代码生成中，自动合并为完整文件..."); } catch(e) { console.error("Silent error:", e.message); } }
     const r1 = await anthropic.messages.create({
       model: MAIN_MODEL, max_tokens: 8192, system: activeSystemPrompt,
       messages: [...messages.slice(0,-1), { role: "user", content: lastMsgContent + "\n\nWrite the FIRST HALF only. End with: # === PART 2 CONTINUES ===" }]
     });
     const p1 = ((r1.content[0]||{}).text||"").replace(/```[\w]*\n?|```$/gm,"").trim();
-    if (ctx) { try { await ctx.reply("⚙️ 生成后半部分..."); } catch(e) {} }
+    if (ctx) { try { await ctx.reply("⚙️ 生成后半部分..."); } catch(e) { console.error("Silent error:", e.message); } }
     const r2 = await anthropic.messages.create({
       model: MAIN_MODEL, max_tokens: 8192, system: activeSystemPrompt,
       messages: [...messages.slice(0,-1), { role:"user", content: lastMsgContent }, { role:"assistant", content: p1 }, { role:"user", content: "Continue with the SECOND HALF. Start from where you left off. Code only." }]
@@ -688,7 +709,7 @@ async function askClaude(userId, userMessage, ctx) {
           return ctx.replyWithDocument({ source: buf, filename: "code_" + ts + ".txt" }, { caption: "✅ 完整代码\n\n用 /save [版本名] 保存" });
         });
         return null;
-      } catch(e) {}
+      } catch(e) { console.error("Silent error:", e.message); }
     }
     return fullCode;
   }
@@ -746,7 +767,7 @@ async function askClaude(userId, userMessage, ctx) {
       user_id: parseInt(userId),
       role: "stats",
       content: JSON.stringify({ input: inputTokenCount, output: outputTokenCount, ts: Date.now() })
-    }).then(function(){}).catch(function(){});
+    }).then(function(){}).catch(function(e){ console.log("Background task error:", e.message); });
   }
 
     // Clear typing interval and delete placeholder
@@ -825,7 +846,7 @@ async function sendLongMessage(ctx, text) {
   for (let i = 0; i < chunks.length; i++) {
     const suffix = chunks.length > 1 && i < chunks.length - 1 ? "\n\n[" + (i+1) + "/" + chunks.length + "]" : "";
     await ctx.reply(chunks[i] + suffix);
-    if (i < chunks.length - 1) await new Promise(function(r) { setTimeout(r, 300); });
+    if (i < chunks.length - 1) await new Promise(function(r) { setTimeout(r, 1100); }); // Telegram rate limit: 1msg/sec
   }
 }
 
@@ -945,6 +966,16 @@ async function railwayDeploy(repoUrl, projectName, envVars) {
 }
 
 // ── Retry helper ─────────────────────────────────────────────────────────────
+// Global fetch with timeout
+async function fetchWithTimeout(url, options, timeoutMs) {
+  timeoutMs = timeoutMs || 15000;
+  const controller = new AbortController();
+  const timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally { clearTimeout(timer); }
+}
+
 async function withRetry(fn, retries, delayMs) {
   retries = retries || 3;
   delayMs = delayMs || 2000;
@@ -967,6 +998,48 @@ async function withRetry(fn, retries, delayMs) {
 // ── Vibe Coding ───────────────────────────────────────────────────────────────
 const vibeSessions = new Map();
 const pendingBountyAction = new Map();
+const priceCooldown = new Map(); // userId → lastCallTime
+const userRateLimit = new Map(); // userId → {count, reset}
+const activeReminders = new Map(); // timerId → userId
+
+// ── vibe session 持久化 ───────────────────────────────────────────────────────
+async function vibeSessionSave(userId, session) {
+  userId = parseInt(userId);
+  vibeSessions.set(userId, session); // keep in-memory
+  if (!supabase || !session) return;
+  try {
+    await supabase.from("vibe_sessions").upsert({
+      user_id: parseInt(userId),
+      session: JSON.stringify(session),
+      updated_at: new Date().toISOString()
+    });
+  } catch(e) { console.error("vibeSessionSave:", e.message); }
+}
+
+async function vibeSessionLoad(userId) {
+  if (vibeSessions.has(userId)) return vibeSessions.get(userId);
+  if (!supabase) return null;
+  try {
+    const { data } = await supabase.from("vibe_sessions")
+      .select("session").eq("user_id", parseInt(userId)).single();
+    if (data && data.session) {
+      const s = JSON.parse(data.session);
+      await vibeSessionSave(userId, s);
+      return s;
+    }
+  } catch(e) { console.error("Silent error:", e.message); }
+  return null;
+}
+
+async function vibeSessionDelete(userId) {
+  vibeSessions.delete(userId);
+  if (!supabase) return;
+  try {
+    await supabase.from("vibe_sessions").delete().eq("user_id", parseInt(userId));
+  } catch(e) { console.error("vibeSessionDelete:", e.message); }
+}
+
+
 
 async function getGitHubUser() {
   const res = await fetch("https://api.github.com/user", {
@@ -1053,18 +1126,18 @@ async function generateProjectFiles(idea, techStack, details) {
   const part2 = ((r2.content[0] || {}).text || "").replace(/```[\w]*\n?|```/g, "").trim();
   files[mainFile] = part1 + "\n\n" + part2;
 
-  // Dependencies
-  const depRes = await anthropic.messages.create({
-    model: FAST_MODEL, max_tokens: 300,
-    messages: [{ role: "user", content: isPython ? "List pip packages needed (one per line):\n" + part1.substring(0, 1000) : "Write package.json dependencies for:\n" + idea + "\nTech: " + techStack + "\n\nReturn ONLY valid package.json JSON." }]
-  });
+  // Secondary files in parallel
+  const [depRes, readmeRes] = await Promise.all([
+    anthropic.messages.create({
+      model: FAST_MODEL, max_tokens: 300,
+      messages: [{ role: "user", content: isPython ? "List pip packages needed (one per line):\n" + part1.substring(0, 1000) : "Write package.json for:\n" + idea + "\nTech: " + techStack + "\n\nReturn ONLY valid JSON." }]
+    }),
+    anthropic.messages.create({
+      model: FAST_MODEL, max_tokens: 500,
+      messages: [{ role: "user", content: "Write a README.md for this hackathon project:\nProject: " + idea + "\nTech: " + techStack + "\n\nInclude: title, description, features, setup, usage. Concise but professional." }]
+    })
+  ]);
   files[depFile] = ((depRes.content[0] || {}).text || "").replace(/```[\w]*\n?|```/g, "").trim();
-
-  // README with actual project description
-  const readmeRes = await anthropic.messages.create({
-    model: FAST_MODEL, max_tokens: 500,
-    messages: [{ role: "user", content: "Write a README.md for this hackathon project:\nProject: " + idea + "\nTech: " + techStack + "\n\nInclude: title, description, features, setup instructions, usage. Keep it concise but professional." }]
-  });
   files["README.md"] = ((readmeRes.content[0] || {}).text || "# " + idea).replace(/```[\w]*\n?|```/g, "").trim();
   files[".gitignore"] = isPython ? "__pycache__/\n*.pyc\n.env\nvenv/\n*.log" : "node_modules/\n.env\n*.log\ndist/";
   if (!isPython && !isSolana) files[".env.example"] = "# Environment variables\n# PORT=3000\n# API_KEY=your_key_here";
@@ -1081,7 +1154,7 @@ async function reviewAndFixFiles(files, idea, techStack) {
 bot.command("vibe", async function(ctx) {
   if (!GITHUB_TOKEN) return ctx.reply("Vibe coding 未启用。请在 Railway 添加 GITHUB_TOKEN 环境变量。");
   const userId = ctx.from.id;
-  vibeSessions.set(userId, { step: "idea" });
+  await vibeSessionSave(userId, { step: "idea" });
   await ctx.reply("🚀 Vibe Coding 模式启动！\n\n说说你想做什么？（一句话描述你的项目想法）");
 });
 
@@ -1518,7 +1591,7 @@ bot.command("export", async function(ctx) {
     text += "导出时间: " + new Date().toLocaleString("zh-CN") + "\n\n";
     if (summaries.length > 0) {
       text += "=== 对话摘要 ===\n";
-      summaries.forEach(function(s) { text += "- " + s.content + "\n"; });
+      summaries.forEach(function(s) { text += "- " + (typeof s === "string" ? s : s.content || JSON.stringify(s)) + "\n"; });
       text += "\n";
     }
     text += "=== 最近对话 ===\n";
@@ -1535,6 +1608,10 @@ bot.command("export", async function(ctx) {
 
 // /price - 加密货币价格
 bot.command("price", async function(ctx) {
+  const userId = ctx.from.id;
+  const lastCall = priceCooldown.get(userId) || 0;
+  if (Date.now() - lastCall < 2000) return ctx.reply("⏳ 请稍等...");
+  priceCooldown.set(userId, Date.now());
   const input = ctx.message.text.split(" ").slice(1).join(" ").trim().toLowerCase() || "btc";
 
   // Symbol → CoinGecko ID mapping
@@ -1585,7 +1662,6 @@ bot.command("price", async function(ctx) {
 });
 
 // /remind - 设置提醒
-const reminders = new Map();
 bot.command("remind", async function(ctx) {
   const args = ctx.message.text.split(" ").slice(1);
   if (args.length < 2) return ctx.reply("用法: /remind 30m 提醒内容\n时间格式: 30m / 2h / 1d");
@@ -1597,11 +1673,14 @@ bot.command("remind", async function(ctx) {
   else if (timeStr.endsWith("d")) ms = parseInt(timeStr) * 24 * 60 * 60 * 1000;
   else return ctx.reply("时间格式错误。例子: 30m、2h、1d");
   if (!ms || ms > 7 * 24 * 60 * 60 * 1000) return ctx.reply("时间范围: 1分钟 - 7天");
+  // Cap concurrent reminders per user
+  const userReminders = Array.from(activeReminders.entries()).filter(function(e){return e[1]===userId;}).length;
+  if (userReminders >= 10) return ctx.reply("最多同时10个提醒，请等待之前的提醒触发。");
   const userId = ctx.from.id;
   setTimeout(async function() {
     try {
       await ctx.telegram.sendMessage(userId, "⏰ **提醒！**\n\n" + content);
-    } catch(e) {}
+    } catch(e) { console.error("Silent error:", e.message); }
   }, ms);
   const timeDisplay = timeStr.endsWith("m") ? timeStr.replace("m","") + " 分钟" : timeStr.endsWith("h") ? timeStr.replace("h","") + " 小时" : timeStr.replace("d","") + " 天";
   await ctx.reply("✅ 提醒已设置！将在 " + timeDisplay + " 后提醒你:\n" + content + "\n\n⚠️ 注意：重启 Bot 会取消提醒");
@@ -1620,11 +1699,20 @@ bot.command("template", async function(ctx) {
     if (!name || !tmpl) return ctx.reply("用法: /template save 名称 模板内容\n例如: /template save intro 我是王大神，帮我写...");
     if (!userTemplates.has(userId)) userTemplates.set(userId, {});
     userTemplates.get(userId)[name] = tmpl;
+    // Persist to Supabase
+    await setDoc(userId, "templates", JSON.stringify(userTemplates.get(userId))).catch(function(){});
     return ctx.reply("✅ 模板 [" + name + "] 已保存");
   }
   if (subCmd === "use") {
     const name = args[1];
     const extra = args.slice(2).join(" ");
+    // Load from Supabase if not in memory
+    if (!userTemplates.has(userId)) {
+      try {
+        const saved = await getDoc(userId, "templates");
+        if (saved) userTemplates.set(userId, JSON.parse(saved));
+      } catch(e) { console.error("Caught:", e.message); }
+    }
     const tmpls = userTemplates.get(userId) || {};
     if (!tmpls[name]) return ctx.reply("找不到模板 [" + name + "]。用 /template list 查看所有模板");
     const prompt = tmpls[name] + (extra ? " " + extra : "");
@@ -1686,8 +1774,12 @@ bot.command("help", async function(ctx) {
     "/stats — Token 使用统计\n" +
     "/forget — 清除对话历史\n" +
     "/reset — 重置所有内容\n\n" +
+    "**🔬 Web3 工具**\n" +
+    "/decompile 0x... — 合约反编译+架构分析\n" +
+    "/slither 0x... — Slither 静态安全分析\n" +
+    "/graph [主题] — 生成知识图谱 SVG\n\n" +
     "**📎 文件支持**\n" +
-    "PDF、ZIP、DOCX、XLSX、图片、代码文件、txt、csv、json";
+    "PDF、ZIP、DOCX、XLSX、图片、代码文件";
   await sendLongMessage(ctx, helpText);
 });
 
@@ -1718,8 +1810,11 @@ function scheduleDailyBriefing() {
   const delay = target - now;
   setTimeout(async function() {
     try {
-      const priceRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true");
-      const prices = await priceRes.json();
+      let prices = {};
+      try {
+        const priceRes = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true");
+        prices = await priceRes.json();
+      } catch(e) { console.error("Daily briefing price fetch:", e.message); }
       const fmt = function(id, symbol) {
         const p = prices[id];
         if (!p) return "";
@@ -1815,14 +1910,22 @@ bot.command("imagine", async function(ctx) {
   if (!GEMINI_API_KEY) {
     return ctx.reply("图片生成未启用。请在 Railway Variables 添加 GEMINI_API_KEY。\n\n去 aistudio.google.com 获取免费 API Key。");
   }
-  const prompt = ctx.message.text.split(" ").slice(1).join(" ").trim();
-  if (!prompt) return ctx.reply("用法：/imagine 一只赛博朋克风格的猫");
-
+  const rawPrompt = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!rawPrompt) return ctx.reply("用法：/imagine 一只赛博朋克风格的猫");
   await ctx.reply("🎨 生成中... 请稍等");
   await ctx.sendChatAction("upload_photo");
-
   setImmediate(async function() {
     try {
+      // Auto-enhance prompt (translate CN→EN + add quality keywords)
+      let prompt = rawPrompt;
+      try {
+        const enh = await anthropic.messages.create({
+          model: FAST_MODEL, max_tokens: 120,
+          messages: [{ role: "user", content: "Rewrite as optimal English image generation prompt with style/lighting/quality keywords. Return ONLY the enhanced prompt:\n" + rawPrompt }]
+        });
+        prompt = (enh.content[0] || {}).text.trim() || rawPrompt;
+        console.log("Imagine enhanced:", rawPrompt, "→", prompt.substring(0,80));
+      } catch(e) { prompt = rawPrompt; }
       const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=" + GEMINI_API_KEY, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1856,6 +1959,437 @@ bot.command("imagine", async function(ctx) {
   });
 });
 
+// ── Vercel 自动预览部署 ────────────────────────────────────────────────────────
+async function vercelDeploy(repoUrl, repoName) {
+  const VERCEL_TOKEN = process.env.VERCEL_TOKEN;
+  if (!VERCEL_TOKEN) return null;
+  try {
+    // Create/get project
+    const projRes = await fetch("https://api.vercel.com/v9/projects", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + VERCEL_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: repoName.toLowerCase().replace(/[^a-z0-9-]/g, "-").substring(0, 50),
+        gitRepository: { type: "github", repo: repoUrl.replace("https://github.com/", "") }
+      })
+    });
+    const projData = await projRes.json();
+    const projectId = projData.id || (projData.error && null);
+    if (!projectId) {
+      // Project might already exist — fetch it
+      const listRes = await fetch("https://api.vercel.com/v9/projects/" + repoName.toLowerCase().replace(/[^a-z0-9-]/g, "-").substring(0, 50), {
+        headers: { "Authorization": "Bearer " + VERCEL_TOKEN }
+      });
+      const listData = await listRes.json();
+      if (!listData.id) return null;
+    }
+
+    // Trigger deployment
+    const deployRes = await fetch("https://api.vercel.com/v13/deployments", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + VERCEL_TOKEN, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: repoName.toLowerCase().replace(/[^a-z0-9-]/g, "-").substring(0, 50),
+        gitSource: {
+          type: "github",
+          repo: repoUrl.replace("https://github.com/", ""),
+          ref: "main"
+        },
+        projectSettings: { framework: null }
+      })
+    });
+    const deployData = await deployRes.json();
+    if (deployData.url) return "https://" + deployData.url;
+    return null;
+  } catch(e) {
+    console.error("Vercel deploy error:", e.message);
+    return null;
+  }
+}
+
+// ── Puppeteer 截图 ─────────────────────────────────────────────────────────────
+async function screenshotUrl(url) {
+  try {
+    const puppeteer = require("puppeteer");
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 });
+    await new Promise(function(r) { setTimeout(r, 2000); }); // wait for animations
+    const screenshot = await page.screenshot({ type: "png", fullPage: false });
+    await browser.close();
+    return screenshot; // Buffer
+  } catch(e) {
+    console.error("Screenshot error:", e.message);
+    return null;
+  }
+}
+
+
+// ── Slither 静态分析 ──────────────────────────────────────────────────────────
+async function callSlither(address, network, sourceCode) {
+  if (!SLITHER_API_URL) throw new Error("SLITHER_API_URL 未设置");
+  const payload = sourceCode
+    ? { source_code: sourceCode, contract_name: "Contract" }
+    : { address: address, network: network || "mainnet" };
+  const res = await fetchWithTimeout(SLITHER_API_URL + "/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": SLITHER_API_KEY || "" },
+    body: JSON.stringify(payload)
+  }, 150000);
+  const data = await res.json();
+  if (data.status !== "ok") throw new Error(data.message || "Slither 分析失败");
+  return data;
+}
+
+async function slitherReport(result, address, network) {
+  const f = result.findings || {};
+  const counts = {
+    critical: (f.critical || []).length,
+    high: (f.high || []).length,
+    medium: (f.medium || []).length,
+    low: (f.low || []).length
+  };
+  const summaryRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 1500,
+    messages: [{ role: "user", content: "用中文写一份简洁的智能合约安全报告。\n\n合约: " + result.contract_name + "\nSlither 结果: " + JSON.stringify(f).substring(0, 3000) + "\n\n格式：\n1. 一句话风险评级（安全/低/中/高/危险）\n2. 🔴 Critical 和 🟠 High 每个问题：问题描述 + 后果 + 修复建议\n3. 🟡 Medium 简要列出\n4. 🟢 Low 只说数量\n5. 一句话总结能否交互" }]
+  });
+  const report = (summaryRes.content[0] || {}).text || "";
+  const header = "🛡 **" + result.contract_name + "**\n" +
+    (address ? "📍 " + address.substring(0, 10) + "... | " + network + "\n" : "") +
+    "🔴" + counts.critical + " 🟠" + counts.high +
+    " 🟡" + counts.medium + " 🟢" + counts.low +
+    " | ⏱ " + (result.duration_ms || "?") + "ms\n";
+  return header + report;
+}
+
+// ── DecompileAgent: 合约地址 → 架构分析 ──────────────────────────────────────
+async function decompileContract(address, network) {
+  const etherscanKey = process.env.ETHERSCAN_API_KEY || "";
+  network = (network || "mainnet").toLowerCase();
+  const NETWORK_MAP = {
+    mainnet: "https://api.etherscan.io/api",
+    bsc: "https://api.bscscan.com/api",
+    polygon: "https://api.polygonscan.com/api",
+    arbitrum: "https://api.arbiscan.io/api",
+    optimism: "https://api-optimistic.etherscan.io/api",
+    base: "https://api.basescan.org/api",
+    avax: "https://api.snowtrace.io/api",
+    solana: null // Etherscan-incompatible
+  };
+  const apiBase = NETWORK_MAP[network] || NETWORK_MAP.mainnet;
+  if (!apiBase) return { contractName: "Unknown", address, network, isVerified: false, analysis: "不支持该网络的合约分析", functions: "" };
+
+  // Step 1: Get source code from Etherscan
+  let sourceCode = "";
+  let contractName = "Unknown";
+  let isVerified = false;
+  try {
+    const srcRes = await fetch(apiBase + "?module=contract&action=getsourcecode&address=" + address + "&apikey=" + etherscanKey);
+    const srcData = await srcRes.json();
+    if (srcData.result && srcData.result[0]) {
+      const r = srcData.result[0];
+      sourceCode = r.SourceCode || "";
+      contractName = r.ContractName || "Unknown";
+      isVerified = sourceCode.length > 10;
+    }
+  } catch(e) { console.error("Etherscan fetch:", e.message); }
+
+  // Step 2: Get ABI for function signatures
+  let abi = [];
+  try {
+    const abiRes = await fetch(apiBase + "?module=contract&action=getabi&address=" + address + "&apikey=" + etherscanKey);
+    const abiData = await abiRes.json();
+    if (abiData.result && abiData.result !== "Contract source code not verified") {
+      abi = JSON.parse(abiData.result);
+    }
+  } catch(e) { console.error("Caught:", e.message); }
+
+  // Step 3: Claude analysis
+  const abiSummary = abi.filter(function(x) { return x.type === "function"; })
+    .map(function(f) { return f.name + "(" + (f.inputs||[]).map(function(i){return i.type;}).join(",") + ")"; })
+    .slice(0, 30).join("\n");
+
+  const analysisRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 3000,
+    messages: [{ role: "user", content: "Analyze this smart contract and provide a comprehensive architecture report.\n\nContract: " + contractName + "\nAddress: " + address + "\nNetwork: " + network + "\nVerified Source: " + isVerified + "\n\n" +
+      (isVerified ? "Source Code (first 4000 chars):\n" + sourceCode.substring(0, 4000) : "Source not verified - analyzing ABI only") +
+      "\n\nABI Functions:\n" + abiSummary +
+      "\n\nProvide:\n1. Contract purpose & overview\n2. Core functions explained in plain language\n3. Access control & ownership model\n4. Token/value flow\n5. Security observations (risks, patterns)\n6. Similar known protocols\n7. Overall risk rating (Low/Medium/High)\n\nReply in Chinese." }]
+  });
+  return {
+    contractName,
+    address,
+    network,
+    isVerified,
+    analysis: (analysisRes.content[0] || {}).text || "",
+    functions: abiSummary
+  };
+}
+
+// ── SVG 知识图谱（服务端渲染）─────────────────────────────────────────────────
+async function generateKnowledgeGraph(nodes, edges, title) {
+  // Pure SVG - no canvas dependency needed
+  const W = 800, H = 600, cx = W/2, cy = H/2;
+  const colors = ["#6366f1","#22d3ee","#f59e0b","#10b981","#f43f5e","#a855f7"];
+
+  // Simple force-directed layout approximation
+  const positioned = nodes.map(function(n, i) {
+    const angle = (2 * Math.PI * i) / nodes.length;
+    const r = Math.min(cx, cy) * 0.65;
+    return { ...n, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle), color: colors[i % colors.length] };
+  });
+  const nodeMap = {};
+  positioned.forEach(function(n) { nodeMap[n.id] = n; });
+
+  const edgeSvg = edges.map(function(e) {
+    const s = nodeMap[e.source], t = nodeMap[e.target];
+    if (!s || !t) return "";
+    return '<line x1="' + s.x + '" y1="' + s.y + '" x2="' + t.x + '" y2="' + t.y +
+           '" stroke="#475569" stroke-width="1.5" stroke-dasharray="4"/>' +
+           '<text x="' + ((s.x+t.x)/2) + '" y="' + ((s.y+t.y)/2-4) + '" fill="#94a3b8" font-size="10" text-anchor="middle">' + (e.label||"") + '</text>';
+  }).join("\n");
+
+  const nodeSvg = positioned.map(function(n) {
+    const r = 36;
+    const label = n.label.length > 12 ? n.label.substring(0,11)+"…" : n.label;
+    return '<circle cx="' + n.x + '" cy="' + n.y + '" r="' + r + '" fill="' + n.color + '" fill-opacity="0.85" stroke="#1e293b" stroke-width="2"/>' +
+           '<text x="' + n.x + '" y="' + (n.y+5) + '" fill="white" font-size="11" font-weight="bold" text-anchor="middle">' + label + '</text>';
+  }).join("\n");
+
+  const svg = '<?xml version="1.0" encoding="UTF-8"?>' +
+    '<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">' +
+    '<rect width="100%" height="100%" fill="#0f172a"/>' +
+    '<text x="' + cx + '" y="32" fill="white" font-size="18" font-weight="bold" text-anchor="middle" font-family="sans-serif">' + title + '</text>' +
+    edgeSvg + nodeSvg +
+    '</svg>';
+
+  return Buffer.from(svg, "utf-8");
+}
+
+
+bot.command("decompile", async function(ctx) {
+  const args = ctx.message.text.split(" ").slice(1);
+  const address = args[0];
+  const network = args[1] || "mainnet";
+  if (!address || !address.match(/^0x[a-fA-F0-9]{40}$/)) {
+    return ctx.reply("用法: /decompile 0x合约地址 [network]\n网络: mainnet (默认) | bsc | polygon\n\n例子: /decompile 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+  }
+  await ctx.reply("🔬 分析合约 " + address.substring(0,10) + "...");
+  await ctx.sendChatAction("typing");
+  setImmediate(async function() {
+    try {
+      const result = await decompileContract(address, network);
+      const header = "🔬 **" + result.contractName + "**\n" +
+        "📍 " + address.substring(0,6) + "..." + address.substring(38) + " | " + result.network + "\n" +
+        "✅ 已验证源码: " + (result.isVerified ? "是" : "否") + "\n\n";
+      await sendLongMessage(ctx, header + result.analysis);
+    } catch(e) {
+      await ctx.reply("分析失败: " + e.message);
+    }
+  });
+});
+
+bot.command("slither", async function(ctx) {
+  if (!SLITHER_API_URL) return ctx.reply("❌ Slither 服务未配置。\n请在 Railway Variables 添加 SLITHER_API_URL。");
+  const args = ctx.message.text.split(" ").slice(1);
+  const address = args[0];
+  const network = args[1] || "mainnet";
+  if (!address || !address.match(/^0x[a-fA-F0-9]{40}$/)) {
+    return ctx.reply("用法: /slither 0x合约地址 [network]\n网络: mainnet | bsc | polygon | arbitrum | base | optimism");
+  }
+  await ctx.reply("🛡 Slither 静态分析中... (最多 2 分钟)");
+  await ctx.sendChatAction("typing");
+  setImmediate(async function() {
+    try {
+      const result = await callSlither(address, network);
+      const report = await slitherReport(result, address, network);
+      await sendLongMessage(ctx, report);
+    } catch (e) {
+      await ctx.reply("❌ Slither 分析失败: " + e.message);
+    }
+  });
+});
+
+
+bot.command("graph", async function(ctx) {
+  const topic = ctx.message.text.split(" ").slice(1).join(" ").trim();
+  if (!topic) return ctx.reply("用法: /graph [主题]\n例子: /graph DeFi协议关系图\n       /graph 我的项目架构");
+  await ctx.reply("🗺 生成知识图谱...");
+  await ctx.sendChatAction("upload_photo");
+  setImmediate(async function() {
+    try {
+      // Ask Claude to generate graph data
+      const res = await anthropic.messages.create({
+        model: FAST_MODEL, max_tokens: 800,
+        messages: [{ role: "user", content: "Generate a knowledge graph for: " + topic + "\n\nReply with ONLY valid JSON: {nodes: [{id, label}], edges: [{source, target, label}], title}\nMax 8 nodes, 10 edges. Keep labels short (<15 chars)." }]
+      });
+      const raw = (res.content[0]||{}).text.replace(/```json\n?|```/g,"").trim();
+      const graphData = JSON.parse(raw);
+      const svgBuf = await generateKnowledgeGraph(graphData.nodes, graphData.edges, graphData.title || topic);
+      await withRetry(function() {
+        return ctx.replyWithDocument({ source: svgBuf, filename: "graph.svg" }, { caption: "🗺 " + (graphData.title || topic) });
+      });
+    } catch(e) {
+      await ctx.reply("图谱生成失败: " + e.message);
+    }
+  });
+});
+
+
+// ── Alchemy Webhook Handler (Proxy Upgrade + Large Transfer) ─────────────────
+async function handleAlchemyWebhook(event, bot, chatId) {
+  try {
+    const activity = event.activity || [];
+    for (const tx of activity) {
+      const value = parseFloat(tx.value || 0);
+      const toAddr = (tx.toAddress || "").toLowerCase();
+      const fromAddr = (tx.fromAddress || "").toLowerCase();
+
+      // Large transfer alert (>100 ETH or >$500k equivalent)
+      if (value > 100) {
+        await bot.telegram.sendMessage(chatId,
+          "🚨 **大额转账监控**\n\n" +
+          "💰 数量: " + value + " ETH\n" +
+          "📤 从: " + fromAddr.substring(0,10) + "...\n" +
+          "📥 到: " + toAddr.substring(0,10) + "...\n" +
+          "🔗 Tx: https://etherscan.io/tx/" + tx.hash +
+          "\n\n🔬 正在分析目标合约..."
+        );
+        // Auto-analyze target contract
+        setImmediate(async function() {
+          try {
+            const result = await decompileContract(toAddr, "mainnet");
+            const risk = result.analysis.toLowerCase().includes("risk") ? "⚠️ 发现风险" : "✅ 暂无明显风险";
+            await bot.telegram.sendMessage(chatId,
+              risk + "\n\n**" + result.contractName + "**\n" +
+              result.analysis.substring(0, 800) + "..."
+            );
+            if (SLITHER_API_URL) {
+              try {
+                const slitherResult = await callSlither(toAddr, "mainnet");
+                const slitherRpt = await slitherReport(slitherResult, toAddr, "mainnet");
+                await bot.telegram.sendMessage(chatId, "🛡 Slither 结果:\n\n" + slitherRpt.substring(0, 3500));
+              } catch (e) { console.log("Alchemy auto-slither failed:", e.message); }
+            }
+          } catch(e) { console.error("Auto-audit error:", e.message); }
+        });
+      }
+
+      // Proxy upgrade detection (looks for Upgraded event in logs)
+      if (tx.log && tx.log.topics && tx.log.topics[0] &&
+          tx.log.topics[0].toLowerCase() === "0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b") {
+        const implAddress = "0x" + (tx.log.topics[1] || "").slice(-40);
+        await bot.telegram.sendMessage(chatId,
+          "⚡ **Proxy 合约升级检测**\n\n" +
+          "📍 Proxy: " + toAddr.substring(0,10) + "...\n" +
+          "🆕 新实现: " + implAddress.substring(0,10) + "...\n" +
+          "🔗 Tx: https://etherscan.io/tx/" + tx.hash +
+          "\n\n🔬 自动审计新合约中..."
+        );
+        setImmediate(async function() {
+          try {
+            const result = await decompileContract(implAddress, "mainnet");
+            const buf = Buffer.from(
+              "PROXY UPGRADE AUDIT\nProxy: " + toAddr + "\nNew Impl: " + implAddress + "\n\n" + result.analysis,
+              "utf-8"
+            );
+            await bot.telegram.sendDocument(chatId,
+              { source: buf, filename: "proxy_upgrade_audit.txt" },
+              { caption: "🔬 **新实现合约审计报告**\n\n⚠️ 请人工复核后确认安全" }
+            );
+          } catch(e) { console.error("Proxy audit error:", e.message); }
+        });
+      }
+    }
+  } catch(e) { console.error("Alchemy webhook error:", e.message); }
+}
+
+// ── /watch - 添加合约监控 ────────────────────────────────────────────────────
+const watchedContracts = new Map(); // address → { label, network, userId }
+
+bot.command("watch", async function(ctx) {
+  const args = ctx.message.text.split(" ").slice(1);
+  const address = args[0];
+  const label = args.slice(1).join(" ") || address;
+  if (!address || !address.match(/^0x[a-fA-F0-9]{40}$/)) {
+    const watching = Array.from(watchedContracts.values())
+      .filter(function(w) { return w.userId === ctx.from.id; });
+    if (watching.length === 0) return ctx.reply("用法: /watch 0x合约地址 [标签]\n\n暂无监控中的合约");
+    return ctx.reply("👀 **监控中的合约**:\n\n" +
+      watching.map(function(w) { return "• " + w.label + "\n  " + w.address; }).join("\n\n")
+    );
+  }
+  watchedContracts.set(address.toLowerCase(), {
+    address: address.toLowerCase(), label, network: "mainnet", userId: ctx.from.id
+  });
+  await ctx.reply("👀 已添加监控: **" + label + "**\n" + address + "\n\n当有大额转账或升级事件时自动报警并分析。");
+  // Run initial audit
+  await ctx.reply("🔬 运行初始审计...");
+  setImmediate(async function() {
+    try {
+      const result = await decompileContract(address, "mainnet");
+      await sendLongMessage(ctx, "📋 **初始审计: " + result.contractName + "**\n\n" + result.analysis);
+    } catch(e) { await ctx.reply("初始审计失败: " + e.message); }
+  });
+});
+
+// ── Alchemy Webhook Express endpoint ─────────────────────────────────────────
+// This gets registered in the launch() function
+function setupAlchemyWebhookRoute(app, bot) {
+  const PIPELINE_OWNER_ID = parseInt(process.env.PIPELINE_OWNER_ID || "0");
+  const ALCHEMY_SIGNING_KEY = process.env.ALCHEMY_SIGNING_KEY || "";
+
+  app.post("/webhook/alchemy", async function(req, res) {
+    // Verify Alchemy signature to prevent spoofed payloads
+    if (ALCHEMY_SIGNING_KEY) {
+      const crypto = require("crypto");
+      const rawBody = JSON.stringify(req.body);
+      const signature = req.headers["x-alchemy-signature"] || "";
+      const expected = crypto.createHmac("sha256", ALCHEMY_SIGNING_KEY).update(rawBody).digest("hex");
+      if (signature !== expected) {
+        console.warn("Alchemy webhook: invalid signature, rejecting");
+        return res.status(401).send("Unauthorized");
+      }
+    }
+
+    res.status(200).send("OK"); // respond fast
+    const event = req.body;
+    if (!event || !PIPELINE_OWNER_ID) return;
+    // Check if any activity involves watched contracts
+    const activity = event.activity || [];
+    const relevant = activity.some(function(tx) {
+      return watchedContracts.has((tx.toAddress || "").toLowerCase()) ||
+             watchedContracts.has((tx.fromAddress || "").toLowerCase()) ||
+             parseFloat(tx.value || 0) > 100; // always alert on 100+ ETH
+    });
+    if (relevant) {
+      await handleAlchemyWebhook(event, bot, PIPELINE_OWNER_ID);
+    }
+  });
+}
+
+
+bot.command("cancel", async function(ctx) {
+  const userId = ctx.from.id;
+  let cancelled = [];
+  if (vibeSessions.has(userId)) { await vibeSessionDelete(userId); cancelled.push("Vibe session"); }
+  if (pendingFix.has(userId)) { pendingFix.delete(userId); cancelled.push("Fix mode"); }
+  if (pendingBountyAction.has(userId)) { pendingBountyAction.delete(userId); cancelled.push("Bounty action"); }
+  // Mark agent tasks as cancelled in Supabase
+  if (supabase) {
+    await supabase.from("agent_tasks").update({ status: "cancelled" })
+      .eq("user_id", userId).eq("status", "running").catch(function(){});
+    cancelled.push("Agent tasks");
+  }
+  if (cancelled.length === 0) return ctx.reply("没有正在运行的任务。");
+  await ctx.reply("⛔ 已取消: " + cancelled.join(", "));
+});
+
+
 bot.command("stats", async function(ctx) {
   const userId = ctx.from.id;
   let usage = tokenUsage.get(userId) || { input: 0, output: 0, calls: 0 };
@@ -1872,12 +2406,12 @@ bot.command("stats", async function(ctx) {
             acc.input += d.input || 0;
             acc.output += d.output || 0;
             acc.calls += 1;
-          } catch(e) {}
+          } catch(e) { console.error("Silent error:", e.message); }
           return acc;
         }, { input: 0, output: 0, calls: 0 });
         usage = totals;
       }
-    } catch(e) {}
+    } catch(e) { console.error("Silent error:", e.message); }
   }
   const cost = estimateCost(usage.input, usage.output);
   const avgInput = usage.calls > 0 ? Math.round(usage.input / usage.calls) : 0;
@@ -1935,6 +2469,19 @@ setTimeout(function() {
 bot.on("text", async function(ctx) {
   const userId = ctx.from.id;
   let userMessage = ctx.message.text;
+
+  // Rate limit: 30 req/min per user (commands excluded)
+  if (!userMessage.startsWith("/")) {
+    const _now = Date.now();
+    const _rl = userRateLimit.get(userId) || { count: 0, reset: _now + 60000 };
+    if (_now > _rl.reset) { _rl.count = 0; _rl.reset = _now + 60000; }
+    _rl.count++;
+    userRateLimit.set(userId, _rl);
+    if (_rl.count > 30) {
+      if (_rl.count === 31) await ctx.reply("⚠️ 请求太频繁，请等1分钟后继续。");
+      return;
+    }
+  }
 
   // If replying to a long message, trim the context
   if (ctx.message.reply_to_message && ctx.message.reply_to_message.text) {
@@ -1996,6 +2543,33 @@ bot.on("text", async function(ctx) {
 
   // Handle vibe coding session
   // Handle pending bounty action confirmation
+  // 自动检测合约地址 → 主动审计
+  const addrMatch = userMessage.match(/0x[a-fA-F0-9]{40}/);
+  const isAuditIntent = /审计|安全|检查|漏洞|audit|security|scan|slither|安不安全/i.test(userMessage);
+  if (addrMatch && isAuditIntent && SLITHER_API_URL && !userMessage.startsWith("/")) {
+    const address = addrMatch[0];
+    let network = "mainnet";
+    if (/bsc|bnb|币安/i.test(userMessage)) network = "bsc";
+    else if (/polygon|matic/i.test(userMessage)) network = "polygon";
+    else if (/arb/i.test(userMessage)) network = "arbitrum";
+    else if (/op|optimism/i.test(userMessage)) network = "optimism";
+    else if (/base/i.test(userMessage)) network = "base";
+    await ctx.reply("🛡 检测到合约地址，自动调用 Slither 审计 (" + network + ")...");
+    setImmediate(async function() {
+      try {
+        const result = await callSlither(address, network);
+        const report = await slitherReport(result, address, network);
+        await sendLongMessage(ctx, report);
+      } catch (e) {
+        await ctx.reply("❌ 自动审计失败: " + e.message + "\n\n可以试试 /decompile " + address + " " + network);
+      }
+    });
+    return;
+  }
+
+  // Restore vibe session from Supabase if not in memory
+  if (!vibeSessions.has(userId)) { await vibeSessionLoad(userId); }
+
   if (pendingBountyAction.has(userId) && !userMessage.startsWith("/")) {
     const action = pendingBountyAction.get(userId);
     const cancelled = userMessage.includes("取消") || userMessage.toLowerCase().includes("cancel") || userMessage.includes("不需要") || userMessage.includes("跳过");
@@ -2039,7 +2613,7 @@ bot.on("text", async function(ctx) {
         session.idea = ideaText;
         session.url = urlMatch[0];
         session.step = "building";
-        vibeSessions.set(userId, session);
+        await vibeSessionSave(userId, session);
         await ctx.reply("🔍 检测到链接，自动抓取赏金详情...");
         await ctx.sendChatAction("typing");
 
@@ -2066,7 +2640,7 @@ bot.on("text", async function(ctx) {
         if (!fetchedContent || fetchedContent.trim().length < 200) {
           // Can't scrape - ask user to paste details
           session.step = "manual_details";
-          vibeSessions.set(userId, session);
+          await vibeSessionSave(userId, session);
           return ctx.reply("⚠️ 无法自动抓取该页面内容。\n\n请直接把赏金/黑客松的要求粘贴给我：\n（主题、要求、技术栈要求、评分标准等）");
         }
 
@@ -2081,11 +2655,11 @@ bot.on("text", async function(ctx) {
         try {
           const raw = (classifyRes.content[0] || {}).text || "{}";
           classify = JSON.parse(raw.replace(/```json\n?|```/g, "").trim());
-        } catch(e) {}
+        } catch(e) { console.error("Silent error:", e.message); }
 
         if (classify.type === "content") {
           // Content bounty - auto generate submission
-          vibeSessions.delete(userId);
+          await vibeSessionDelete(userId);
           await ctx.reply("✍️ **内容类赏金** — 自动生成提交内容...");
           await ctx.sendChatAction("typing");
           setImmediate(async function() {
@@ -2115,13 +2689,13 @@ bot.on("text", async function(ctx) {
         session.stack = classify.stack || "Node.js";
         session.details = fetchedContent;
         session.step = "confirm";
-        vibeSessions.set(userId, session);
+        await vibeSessionSave(userId, session);
         return;
       }
 
       session.idea = ideaText;
       session.step = "stack";
-      vibeSessions.set(userId, session);
+      await vibeSessionSave(userId, session);
       return ctx.reply("💡 好的！用什么技术栈？\n\n例如：Node.js, Python, React, Solana\n（不确定就说 '帮我选'）");
     }
 
@@ -2138,35 +2712,49 @@ bot.on("text", async function(ctx) {
       await ctx.reply("确认方向？或者说说你想做什么（直接发 '确认' 开始生成）");
       session.stack = "Node.js";
       session.step = "confirm";
-      vibeSessions.set(userId, session);
+      await vibeSessionSave(userId, session);
       return;
     }
 
     if (session.step === "confirm") {
       const cancelled = userMessage.includes("不需要") || userMessage.includes("取消") || userMessage.includes("算了") || userMessage.toLowerCase().includes("cancel") || userMessage.includes("停");
       if (cancelled) {
-        vibeSessions.delete(userId);
+        await vibeSessionDelete(userId);
         return ctx.reply("好的，已取消。需要时随时发 /vibe 重新开始。");
       }
       // If it looks like a question, exit session and answer normally
       const isQuestion = userMessage.includes("吗") || userMessage.includes("？") || userMessage.includes("?") || userMessage.includes("怎么") || userMessage.includes("什么") || userMessage.includes("能不能") || userMessage.includes("如何");
       if (isQuestion) {
-        vibeSessions.delete(userId);
+        await vibeSessionDelete(userId);
         // fall through to normal chat below
       } else {
         const confirmed = userMessage.includes("确认") || userMessage.toLowerCase().includes("ok") || userMessage.includes("好") || userMessage.includes("开始") || userMessage.includes("继续");
         if (!confirmed) {
           session.idea = userMessage; // treat as updated idea
         }
+        // If agent-ready (from pipeline), run dev agent instead of normal vibe
+        if (session._agentReady && confirmed) {
+          await vibeSessionDelete(userId);
+          await ctx.reply("🤖 开发 Agent 启动中...");
+          setImmediate(async function() {
+            try {
+              const fakeBounty = { title: session.idea, url: session.url || "", platform: "pipeline", description: session.bountyDetails || "", prize: "" };
+              const _tg = ctx.telegram;
+              const _botWrapper = { telegram: _tg };
+              await runDevAgent(fakeBounty, session.details || "", _botWrapper, parseInt(userId));
+            } catch(e) { await ctx.reply("Agent 失败: " + e.message); }
+          });
+          return;
+        }
           session.step = "building";
-        vibeSessions.set(userId, session);
+        await vibeSessionSave(userId, session);
         await ctx.reply("⚙️ 开始生成项目...请稍等 60-120 秒");
         await ctx.sendChatAction("typing");
         // fall through to building block below
       }
     }
 
-    if (session.step === "building" && session.step !== "details") {
+    if (session.step === "building") {
       // Already set to building by confirm step - run generation now
       if (session.stack) { // only if stack is already set (from URL flow)
         try {
@@ -2185,11 +2773,39 @@ bot.on("text", async function(ctx) {
           const validFiles = {};
           Object.entries(reviewedFiles).forEach(function(e) { if (e[1] && e[1].length > 0) validFiles[e[0]] = e[1]; });
           const repoUrl = await pushFilesToGitHub(owner, repoName, validFiles);
-          vibeSessions.delete(userId);
+          await vibeSessionDelete(userId);
           const fileList = Object.keys(validFiles).map(function(f) { return "- " + f; }).join("\n");
-          await ctx.reply("🎉 完成！\n\n📦 GitHub: " + repoUrl + "\n\n文件:\n" + fileList + "\n\n下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 部署完成 ✅");
+          await ctx.reply("🎉 完成！\n\n📦 GitHub: " + repoUrl + "\n\n文件:\n" + fileList);
+          // Auto Vercel preview
+          if (process.env.VERCEL_TOKEN) {
+            await ctx.reply("⚡ 正在部署预览...");
+            setImmediate(async function() {
+              try {
+                const previewUrl = await vercelDeploy(repoUrl, repoName);
+                if (previewUrl) {
+                  await ctx.reply("🌐 预览链接: " + previewUrl + "\n\n截图中...");
+                  await new Promise(function(r) { setTimeout(r, 15000); }); // wait for deploy
+                  const shot = await screenshotUrl(previewUrl);
+                  if (shot) {
+                    await withRetry(function() {
+                      return ctx.replyWithPhoto({ source: shot }, { caption: "📸 实时预览截图\n🔗 " + previewUrl });
+                    });
+                  } else {
+                    await ctx.reply("🔗 预览: " + previewUrl + "\n（截图失败，请手动访问）");
+                  }
+                } else {
+                  await ctx.reply("下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName);
+                }
+              } catch(e) {
+                console.error("Vercel preview error:", e.message);
+                await ctx.reply("🔗 GitHub: " + repoUrl);
+              }
+            });
+          } else {
+            await ctx.reply("下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 部署完成 ✅\n\n💡 加 VERCEL_TOKEN 环境变量可自动预览");
+          }
         } catch (err) {
-          vibeSessions.delete(userId);
+          await vibeSessionDelete(userId);
           await ctx.reply("生成失败: " + err.message + "\n\n请重新发 /vibe 再试。");
         }
         return;
@@ -2204,14 +2820,14 @@ bot.on("text", async function(ctx) {
       }
       session.stack = stack;
       session.step = "details";
-      vibeSessions.set(userId, session);
+      await vibeSessionSave(userId, session);
       return ctx.reply("📝 还有什么额外要求？\n\n例如：需要数据库、特定 API、特殊功能\n（没有就发 '没有'）");
     }
 
     if (session.step === "details") {
       session.details = userMessage;
       session.step = "building";
-      vibeSessions.set(userId, session);
+      await vibeSessionSave(userId, session);
       await ctx.reply("⚙️ 开始生成项目...请稍等 60-120 秒");
       await ctx.sendChatAction("typing");
 
@@ -2248,18 +2864,18 @@ bot.on("text", async function(ctx) {
         });
 
         if (Object.keys(validFiles).length === 0) {
-          vibeSessions.delete(userId);
+          await vibeSessionDelete(userId);
           return ctx.reply("生成的文件内容为空，请重新 /vibe 再试。");
         }
 
         const repoUrl = await pushFilesToGitHub(owner, repoName, validFiles);
-        vibeSessions.delete(userId);
+        await vibeSessionDelete(userId);
 
         const fileList = Object.keys(validFiles).map(function(f) { return "- " + f; }).join("\n");
         await ctx.reply("🎉 完成！\n\n📦 GitHub: " + repoUrl + "\n\n文件:\n" + fileList + "\n\n下一步:\n1. Railway → New Project → Deploy from GitHub\n2. 选择 " + repoName + "\n3. 部署完成 ✅");
       } catch (err) {
         console.error("Vibe error:", err.message);
-        vibeSessions.delete(userId);
+        await vibeSessionDelete(userId);
         await ctx.reply("生成失败: " + err.message + "\n\n请重新发 /vibe 再试。");
       }
       return;
@@ -2362,14 +2978,13 @@ bot.on("text", async function(ctx) {
       }
     } catch (err) {
       console.error("Claude error:", err.message);
-      try { await ctx.reply("出错了，请稍后再试。"); } catch(e) {}
+      try { await ctx.reply("出错了，请稍后再试。"); } catch(e) { console.error("Silent error:", e.message); }
     }
   });
 });
 
 // ── 处理图片 ──────────────────────────────────────────────────────────────────
 // Cache for photo media groups
-const photoGroupCache = new Map();
 const mixedGroupCache = new Map(); // unified cache for photos+docs mixed groups
 
 
@@ -2412,8 +3027,8 @@ async function processMixedGroup(ctx, userId, photos, docs, caption) {
   // Add photos
   for (let i = 0; i < photos.length; i++) {
     try {
-      const file = await ctx.telegram.getFile(photos[i].file_id);
-      const url = "https://api.telegram.org/file/bot" + BOT_TOKEN + "/" + file.file_path;
+      const fileLink = await withRetry(function() { return ctx.telegram.getFileLink(photos[i].file_id); });
+      const url = fileLink.href;
       const buf = Buffer.from(await (await fetch(url)).arrayBuffer());
       contentParts.push({ type: "text", text: "[图片 " + (i+1) + "]" });
       contentParts.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: buf.toString("base64") } });
@@ -2653,7 +3268,7 @@ bot.on("document", async function(ctx) {
               const text = await zip.files[name].async("string");
               codeContent += "\n\n=== " + name + " ===\n" + text.substring(0, 3000);
               readCount++;
-            } catch(e) {}
+            } catch(e) { console.error("Silent error:", e.message); }
           }
         }
         const summary = "ZIP: " + fileName + "\n文件 (" + fileList.length + " 个):\n" + fileList.slice(0, 30).join("\n") + (fileList.length > 30 ? "\n..." : "");
@@ -2785,7 +3400,20 @@ bot.on("document", async function(ctx) {
 
 // ── 启动 ──────────────────────────────────────────────────────────────────────
 // Start daily briefing scheduler
-scheduleDailyBriefing();
+// scheduleDailyBriefing called after constants
+
+
+// ── Map TTL 清理（防内存泄漏）────────────────────────────────────────────────
+setInterval(function() {
+  const now = Date.now();
+  // pendingBountyAction: 30 min TTL
+  pendingBountyAction.forEach(function(val, key) {
+    if (val._ts && now - val._ts > 30 * 60 * 1000) pendingBountyAction.delete(key);
+  });
+  // streamedReplies: clear old entries (max 100)
+  if (streamedReplies.size > 100) streamedReplies.clear();
+  // processedChannelPosts: already capped at 500
+}, 5 * 60 * 1000); // every 5 minutes
 
 async function launch() {
   if (WEBHOOK_URL) {
@@ -2794,9 +3422,11 @@ async function launch() {
     app.use(bot.webhookCallback("/webhook"));
     app.get("/", function(_req, res) { res.send("Claude AI Bot v5 - Running!"); });
     await bot.telegram.setWebhook(WEBHOOK_URL + "/webhook");
+    setupAlchemyWebhookRoute(app, bot);
     app.listen(PORT, function() {
       console.log("Webhook running on port " + PORT);
       console.log("Webhook set to " + WEBHOOK_URL + "/webhook");
+      console.log("Alchemy endpoint: " + WEBHOOK_URL + "/webhook/alchemy");
     });
   } else {
     await bot.launch();
@@ -2833,7 +3463,12 @@ bot.telegram.setMyCommands([
   { command: "pipeline", description: "🤖 手动触发赏金扫描" },
   { command: "pipelinestatus", description: "📡 Pipeline状态" },
   { command: "forget", description: "🗑 清除对话历史" },
-  { command: "reset", description: "⚠️ 重置所有内容" }
+  { command: "reset", description: "⚠️ 重置所有内容" },
+  { command: "decompile", description: "🔬 分析合约 /decompile 0x... [network]" },
+  { command: "slither", description: "🛡 Slither 合约审计 /slither 0x..." },
+  { command: "graph", description: "🗺 生成知识图谱 /graph [主题]" },
+  { command: "watch", description: "👀 监控合约 /watch 0x... [标签]" },
+  { command: "cancel", description: "⛔ 取消当前所有任务" }
 ]).catch(console.error);
 
 // PDF 文件处理
@@ -3017,8 +3652,38 @@ process.once("SIGTERM", function() {
 
 // ── 全自动赏金 Pipeline ────────────────────────────────────────────────────────
 
-const seenBounties = new Set(); // NOTE: resets on restart, bounties seen before restart will re-evaluate
+const seenBounties = new Set();
+
+// Load seenBounties from Supabase on startup
+async function loadSeenBounties() {
+  if (!supabase) return;
+  try {
+    const { data } = await supabase.from("user_docs")
+      .select("content").eq("user_id", 0).eq("doc_type", "seen_bounties").single();
+    if (data && data.content) {
+      JSON.parse(data.content).forEach(function(id) { seenBounties.add(id); });
+      console.log("Loaded " + seenBounties.size + " seen bounties from Supabase");
+    }
+  } catch(e) { console.error("Caught:", e.message); }
+}
+
+async function saveSeenBounties() {
+  if (!supabase) return;
+  // Keep last 500 only
+  const ids = Array.from(seenBounties).slice(-500);
+  try {
+    await supabase.from("user_docs").upsert({
+      user_id: 0, doc_type: "seen_bounties",
+      content: JSON.stringify(ids),
+      updated_at: new Date().toISOString()
+    });
+  } catch(e) { console.error("saveSeenBounties:", e.message); }
+}
 const PIPELINE_OWNER = process.env.PIPELINE_OWNER_ID;
+// Start scheduler after all constants defined
+scheduleDailyBriefing();
+setTimeout(checkInterruptedAgents, 5000);
+loadSeenBounties().catch(function(){});
 const PIPELINE_HOURS = process.env.PIPELINE_HOURS
   ? process.env.PIPELINE_HOURS.split(",").map(function(h) { return parseInt(h.trim()); })
   : null; // null = run anytime
@@ -3030,29 +3695,8 @@ const PIPELINE_ENABLED = process.env.PIPELINE_ENABLED === "true";
 
 // Scan Superteam bounties
 async function scanSuperteam() {
-  try {
-    const res = await fetch("https://earn.superteam.fun/api/listings/?type=bounty&status=open&take=20", {
-      headers: { "User-Agent": "Mozilla/5.0" }
-    });
-    const data = await res.json();
-    const items = data.data || data.listings || data || [];
-    return items.map(function(b) {
-      return {
-        id: "superteam_" + (b.id || b.slug),
-        title: b.title || b.name,
-        url: "https://earn.superteam.fun/listings/" + (b.slug || b.id),
-        reward: b.rewardAmount || b.reward || 0,
-        currency: b.token || "USDC",
-        type: b.type || "bounty",
-        deadline: b.deadline,
-        description: b.description || b.shortDescription || "",
-        platform: "Superteam"
-      };
-    });
-  } catch (err) {
-    console.error("Superteam scan error:", err.message);
-    return [];
-  }
+  // Superteam blocks server-side scraping (403) - handled via Channel listener instead
+  return [];
 }
 
 
@@ -3190,7 +3834,7 @@ async function scanDoraHacks() {
 // Score bounty with Claude
 async function scoreBounty(bounty) {
   try {
-    const prompt = "Score this bounty opportunity from 1-10 for someone who is a Crypto builder, content creator, and developer.\n\nBounty: " + bounty.title + "\nPlatform: " + bounty.platform + "\nType: " + bounty.type + "\nReward: " + bounty.reward + " " + bounty.currency + "\nDeadline: " + (bounty.deadline || "unknown") + "\nDescription: " + (bounty.description || "").substring(0, 500) + "\n\nScore criteria:\n- High reward = higher score\n- Content/dev tasks = higher score (we can automate)\n- Audit/security = medium score\n- Too technical without clear deliverable = lower score\n- Near deadline = lower score\n\nReply with ONLY a JSON object: {\"score\": 7, \"type\": \"content|dev|audit|hackathon\", \"reason\": \"brief reason\", \"deliverable\": \"what needs to be submitted\"}";
+    const prompt = "Score this bounty opportunity from 1-10 for someone who is a Crypto builder, content creator, and developer.\n\nBounty: " + bounty.title + "\nPlatform: " + bounty.platform + "\nType: " + bounty.type + "\nReward: " + bounty.reward + " " + bounty.currency + "\nDeadline: " + (bounty.deadline || "unknown") + "\nDescription: " + (bounty.description || "").substring(0, 500) + "\n\nScore criteria:\n- High reward = higher score\n- Content/dev tasks = higher score (we can automate)\n- Audit/security = medium score\n- Too technical without clear deliverable = lower score\n- Near deadline = lower score\n\nReply with ONLY a JSON object: {\"score\": 7, \"type\": \"content|dev|audit|hackathon|video\", \"reason\": \"brief reason\", \"deliverable\": \"what needs to be submitted\"}";
 
     const res = await anthropic.messages.create({
       model: FAST_MODEL,
@@ -3206,6 +3850,348 @@ async function scoreBounty(bounty) {
 }
 
 // Execute bounty based on type
+// ── Agent 状态追踪 ─────────────────────────────────────────────────────────────
+const agentTasks = new Map(); // taskId → { status, steps, bounty }
+
+function agentLog(chatId, bot, msg) {
+  console.log("[Agent]", msg);
+  return bot.telegram.sendMessage(chatId, msg).catch(function(){});
+}
+
+async function agentSearch(query) {
+  if (!TAVILY_API_KEY) return "";
+  try {
+    const res = await fetch("https://api.tavily.com/search", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query, max_results: 3, search_depth: "basic" })
+    });
+    const data = await res.json();
+    return (data.results || []).map(function(r) { return r.title + ": " + r.content; }).join("\n").substring(0, 2000);
+  } catch(e) { return ""; }
+}
+
+// ── 内容类 Agent (5步) ─────────────────────────────────────────────────────────
+
+// ── Agent 进度持久化 ───────────────────────────────────────────────────────────
+async function agentTaskCreate(taskId, userId, type, bounty, totalSteps) {
+  if (!supabase) return;
+  try {
+    await supabase.from("agent_tasks").upsert({
+      id: taskId, user_id: userId, type, status: "running",
+      current_step: 0, total_steps: totalSteps,
+      bounty: bounty, context: {}, updated_at: new Date().toISOString()
+    });
+  } catch(e) { console.log("agentTaskCreate error:", e.message); }
+}
+
+async function agentTaskStep(taskId, step, contextUpdate) {
+  if (!supabase) return;
+  try {
+    const { data } = await supabase.from("agent_tasks").select("context").eq("id", taskId).single();
+    const ctx = (data && data.context) || {};
+    await supabase.from("agent_tasks").update({
+      current_step: step,
+      context: { ...ctx, ...contextUpdate },
+      updated_at: new Date().toISOString()
+    }).eq("id", taskId);
+  } catch(e) { console.log("agentTaskStep error:", e.message); }
+}
+
+async function agentTaskDone(taskId, status) {
+  if (!supabase) return;
+  try {
+    await supabase.from("agent_tasks").update({
+      status: status || "done", updated_at: new Date().toISOString()
+    }).eq("id", taskId);
+  } catch(e) { console.error("Silent error:", e.message); }
+}
+
+// On startup: check for interrupted agent tasks and notify user
+async function checkInterruptedAgents() {
+  if (!supabase || !PIPELINE_OWNER) return;
+  try {
+    const { data } = await supabase.from("agent_tasks")
+      .select("*").eq("status", "running")
+      .lt("updated_at", new Date(Date.now() - 10 * 60 * 1000).toISOString()); // >10min old
+    if (data && data.length > 0) {
+      const msg = "⚠️ 发现 " + data.length + " 个未完成的 Agent 任务（Bot 重启导致）:\n\n" +
+        data.map(function(t) { return "• [" + t.type + "] " + (t.bounty && t.bounty.title || t.id) + " (步骤 " + t.current_step + "/" + t.total_steps + ")"; }).join("\n") +
+        "\n\n发 /pipeline 重新触发扫描。";
+      await bot.telegram.sendMessage(parseInt(PIPELINE_OWNER), msg).catch(function(){});
+      // Mark as failed
+      await supabase.from("agent_tasks").update({ status: "interrupted" })
+        .in("id", data.map(function(t) { return t.id; }));
+    }
+  } catch(e) { console.error("Silent error:", e.message); }
+}
+
+
+// ── 视频类 Agent (4步) ─────────────────────────────────────────────────────────
+async function runVideoAgent(bounty, fullDesc, bot, chatId) {
+  const taskId = "video_" + chatId + "_" + Date.now();
+  await agentTaskCreate(taskId, chatId, "video", bounty, 4);
+  await agentLog(chatId, bot, "🎬 **视频 Agent 启动**\n📌 " + bounty.title);
+
+  // Step 1: 分析视频要求
+  await agentLog(chatId, bot, "📋 [1/4] 分析视频要求...");
+  const analyzeRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 500,
+    messages: [{ role: "user", content: "Analyze this video bounty:\n\n" + fullDesc.substring(0, 2000) + "\n\nExtract JSON: {platform: 'TikTok/Reels/Shorts', duration: '30-60s', style: 'educational/entertaining', targetAudience, keyMessages: [], tone}" }]
+  });
+  let reqs = { platform: "TikTok/Reels", duration: "30-60s", style: "educational", targetAudience: "Gen Z", keyMessages: [], tone: "casual" };
+  try { reqs = JSON.parse((analyzeRes.content[0]||{}).text.replace(/```json\n?|```/g,"").trim()); } catch(e) { console.error("Silent error:", e.message); }
+  await agentTaskStep(taskId, 1, { reqs });
+
+  // Step 2: 搜索参考内容
+  await agentLog(chatId, bot, "🔍 [2/4] 搜索参考内容...");
+  const searchResults = await agentSearch(bounty.title + " " + reqs.targetAudience + " video script example");
+  await agentTaskStep(taskId, 2, { searchResults: searchResults.substring(0,200) });
+
+  // Step 3: 生成完整视频脚本
+  await agentLog(chatId, bot, "✍️ [3/4] 生成视频脚本...");
+  const scriptRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 3000,
+    messages: [{ role: "user", content: "Write a complete video script for this bounty:\n\nBounty: " + bounty.title + "\nPlatform: " + reqs.platform + "\nDuration: " + reqs.duration + "\nAudience: " + reqs.targetAudience + "\nTone: " + reqs.tone + "\nKey messages: " + (reqs.keyMessages||[]).join(", ") + "\n\nBounty details:\n" + fullDesc.substring(0,2000) + "\n\nInclude:\n- Hook (first 3 seconds)\n- Scene-by-scene breakdown with timestamps\n- Exact spoken dialogue\n- Visual/B-roll suggestions\n- On-screen text/captions\n- CTA ending\n- Suggested audio/music style\n\nMake it production-ready." }]
+  });
+  const script = (scriptRes.content[0]||{}).text || "";
+  await agentTaskStep(taskId, 3, { scriptLen: script.length });
+
+  // Step 4: 生成制作建议
+  await agentLog(chatId, bot, "🎨 [4/4] 生成制作建议...");
+  const prodRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 800,
+    messages: [{ role: "user", content: "Based on this video script for " + bounty.title + ", give practical production tips:\n1. Required equipment (budget-friendly)\n2. Filming setup\n3. Editing tips for " + reqs.platform + "\n4. Thumbnail/cover suggestions\n5. Submission checklist\n\nScript summary: " + script.substring(0,500) }]
+  });
+  const prodTips = (prodRes.content[0]||{}).text || "";
+
+  const output = "VIDEO BOUNTY: " + bounty.title + "\nURL: " + bounty.url + "\nPlatform: " + reqs.platform + " | Duration: " + reqs.duration + "\n\n" +
+    "═══ VIDEO SCRIPT ═══\n\n" + script + "\n\n" +
+    "═══ PRODUCTION TIPS ═══\n\n" + prodTips;
+  const buf = Buffer.from(output, "utf-8");
+  await agentTaskDone(taskId, "done");
+  await bot.telegram.sendDocument(chatId,
+    { source: buf, filename: "video_script_" + Date.now().toString().slice(-4) + ".txt" },
+    { caption: "🎬 **视频脚本完成**\n\n包含：完整脚本 + 制作建议\n\n去这里提交: " + bounty.url }
+  );
+}
+
+async function runContentAgent(bounty, fullDesc, bot, chatId) {
+  const taskId = "content_" + chatId + "_" + Date.now();
+  await agentTaskCreate(taskId, chatId, "content", bounty, 5);
+  await agentLog(chatId, bot, "🤖 **内容 Agent 启动**\n📌 " + bounty.title);
+
+  // Step 1: 分析平台风格和要求
+  await agentLog(chatId, bot, "📋 [1/5] 分析要求和平台风格...");
+  const analyzeRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 800,
+    messages: [{ role: "user", content: "Analyze this content bounty requirements in detail:\n\nBounty: " + bounty.title + "\nPlatform: " + bounty.platform + "\nDescription: " + fullDesc.substring(0, 3000) + "\n\nExtract: 1) Content type (article/thread/video script/etc) 2) Required length 3) Tone and style 4) Key topics to cover 5) Submission format. Reply in JSON: {type, length, tone, topics: [], format}" }]
+  });
+  let requirements = { type: "article", length: "500-1000 words", tone: "professional", topics: [], format: "text" };
+  await agentTaskStep(taskId, 1, { requirements_raw: analyzeRes.content[0]?.text });
+  try { requirements = JSON.parse((analyzeRes.content[0] || {}).text.replace(/```json\n?|```/g, "").trim()); } catch(e) { console.error("Silent error:", e.message); }
+
+  // Step 2: 搜索背景资料
+  await agentLog(chatId, bot, "🔍 [2/5] 搜索相关背景资料...");
+  await agentTaskStep(taskId, 2, { requirements });
+  const searchQuery = bounty.title + " " + (requirements.topics || []).slice(0,2).join(" ");
+  const searchResults = await agentSearch(searchQuery);
+
+  // Step 3: 生成提交内容
+  await agentLog(chatId, bot, "✍️ [3/5] 生成提交内容...");
+  await agentTaskStep(taskId, 3, { searchResults });
+  const writeRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 4096,
+    messages: [{ role: "user", content: "Write a " + requirements.type + " for this bounty submission:\n\nBounty: " + bounty.title + "\nPlatform: " + bounty.platform + "\nRequirements: " + JSON.stringify(requirements) + "\nBackground research:\n" + searchResults + "\n\nFull bounty details:\n" + fullDesc.substring(0, 2000) + "\n\nWrite " + requirements.length + " in a " + requirements.tone + " tone. Make it submission-ready. No meta-commentary." }]
+  });
+  const draft = (writeRes.content[0] || {}).text || "";
+
+  // Step 4: 自我审查评分
+  await agentLog(chatId, bot, "🔎 [4/5] 自我审查评分...");
+  await agentTaskStep(taskId, 4, { draft: draft.substring(0, 500) });
+  const reviewRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 400,
+    messages: [{ role: "user", content: "Review this submission for the bounty ''" + bounty.title + "''. Score 1-10 on: relevance, quality, completeness, style match. Reply JSON: {score, issues: [], verdict: 'pass|rewrite'}" },
+               { role: "assistant", content: "Here is my review:\n" },
+               { role: "user", content: "Submission:\n" + draft.substring(0, 2000) }]
+  });
+  let review = { score: 7, issues: [], verdict: "pass" };
+  try { review = JSON.parse((reviewRes.content[0] || {}).text.replace(/```json\n?|```/g, "").trim()); } catch(e) { console.error("Silent error:", e.message); }
+
+  let finalContent = draft;
+
+  // Step 5: 重写或输出
+  if (review.verdict === "rewrite" && review.score < 7) {
+    await agentLog(chatId, bot, "🔄 [5/5] 评分 " + review.score + "/10，重写中... 问题: " + (review.issues || []).join(", "));
+    const rewriteRes = await anthropic.messages.create({
+      model: MAIN_MODEL, max_tokens: 4096,
+      messages: [
+        { role: "user", content: "Rewrite this submission fixing these issues: " + (review.issues || []).join(", ") + "\n\nOriginal:\n" + draft.substring(0, 3000) }
+      ]
+    });
+    finalContent = (rewriteRes.content[0] || {}).text || draft;
+  } else {
+    await agentLog(chatId, bot, "✅ [5/5] 质量评分 " + review.score + "/10，通过审查");
+  }
+
+  // 输出结果
+  const output = "BOUNTY: " + bounty.title + "\nURL: " + bounty.url + "\nPlatform: " + bounty.platform + "\nScore: " + review.score + "/10\n\n" + finalContent;
+  const buf = Buffer.from(output, "utf-8");
+  await agentTaskDone(taskId, "done");
+  await bot.telegram.sendDocument(chatId,
+    { source: buf, filename: "submission_" + bounty.platform + "_" + Date.now().toString().slice(-4) + ".txt" },
+    { caption: "📄 **内容提交完成** (评分 " + review.score + "/10)\n\n去这里提交: " + bounty.url }
+  );
+}
+
+// ── 开发类 Agent (5步) ─────────────────────────────────────────────────────────
+async function runDevAgent(bounty, fullDesc, bot, chatId) {
+  const taskId = "dev_" + chatId + "_" + Date.now();
+  await agentTaskCreate(taskId, chatId, "dev", bounty, 5);
+  await agentLog(chatId, bot, "🤖 **开发 Agent 启动**\n📌 " + bounty.title);
+
+  // Step 1: 深度分析技术要求
+  await agentLog(chatId, bot, "📋 [1/5] 深度分析技术要求和评审标准...");
+  const analyzeRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 800,
+    messages: [{ role: "user", content: "Analyze this dev/hackathon bounty deeply:\n\n" + fullDesc.substring(0, 3000) + "\n\nExtract: {stack: 'best tech stack', projectIdea: 'specific project to build', keyFeatures: [], evaluationCriteria: [], winningTips: []}. Reply JSON only." }]
+  });
+  let analysis = { stack: "Node.js", projectIdea: bounty.title, keyFeatures: [], evaluationCriteria: [], winningTips: [] };
+  try { analysis = JSON.parse((analyzeRes.content[0] || {}).text.replace(/```json\n?|```/g, "").trim()); } catch(e) { console.error("Silent error:", e.message); }
+
+  // Step 2: 搜索参考项目
+  await agentLog(chatId, bot, "🔍 [2/5] 搜索同类项目参考...");
+  await agentTaskStep(taskId, 2, { analysis });
+  const refSearch = await agentSearch(analysis.projectIdea + " open source github " + analysis.stack);
+
+  // Step 3: 生成项目架构
+  await agentLog(chatId, bot, "🏗 [3/5] 设计项目架构...");
+  await agentTaskStep(taskId, 3, { refSearch: refSearch.substring(0, 200) });
+  const archRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 600,
+    messages: [{ role: "user", content: "Design architecture for: " + analysis.projectIdea + "\nStack: " + analysis.stack + "\nKey features: " + (Array.isArray(analysis.keyFeatures) ? analysis.keyFeatures : []).join(", ") + "\nReference: " + refSearch.substring(0, 500) + "\n\nReply with: file structure, core components, API design (2-3 sentences each). Chinese OK." }]
+  });
+  const arch = (archRes.content[0] || {}).text || "";
+  await agentLog(chatId, bot, "📐 架构设计:\n" + arch.substring(0, 300) + "...");
+
+  // Step 4: 生成代码并推 GitHub
+  await agentLog(chatId, bot, "⚙️ [4/5] 生成代码并推送 GitHub...");
+  await agentTaskStep(taskId, 4, { arch: arch.substring(0, 200) });
+  const bountyContext = "Title: " + bounty.title + "\nStack: " + analysis.stack + "\nKey Features: " + (Array.isArray(analysis.keyFeatures) ? analysis.keyFeatures : []).join(", ") + "\nEvaluation: " + (Array.isArray(analysis.evaluationCriteria) ? analysis.evaluationCriteria : []).join(", ") + "\n\nFull details:\n" + fullDesc.substring(0, 2000);
+
+  let repoUrl = null;
+  try {
+    const files = await generateProjectFiles(analysis.projectIdea, analysis.stack, bountyContext);
+    const ghUser = await getGitHubUser();
+    const owner = ghUser.login;
+    const slug = analysis.projectIdea.toLowerCase().replace(/[^a-z0-9 ]/g, " ").trim().split(/ +/).slice(0,4).join("-");
+    const repoName = (slug || "project") + "-" + Date.now().toString().slice(-4);
+    await createGitHubRepo(repoName, analysis.projectIdea);
+    await new Promise(function(r) { setTimeout(r, 3000); });
+    const validFiles = {};
+    Object.entries(files).forEach(function(e) { if (e[1] && e[1].length > 0) validFiles[e[0]] = e[1]; });
+    repoUrl = await pushFilesToGitHub(owner, repoName, validFiles);
+    await agentLog(chatId, bot, "✅ GitHub 推送成功: " + repoUrl);
+  } catch(e) {
+    await agentLog(chatId, bot, "⚠️ GitHub 推送失败: " + e.message + "\n继续生成提交说明...");
+  }
+
+  // Step 5: 生成提交说明
+  await agentLog(chatId, bot, "📝 [5/5] 生成提交说明和 Demo 脚本...");
+  const submissionRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 2000,
+    messages: [{ role: "user", content: "Write a hackathon project submission description for:\n\nProject: " + analysis.projectIdea + "\nStack: " + analysis.stack + "\nFeatures: " + (Array.isArray(analysis.keyFeatures) ? analysis.keyFeatures : []).join(", ") + "\nGitHub: " + (repoUrl || "TBD") + "\nWinning tips from bounty: " + (Array.isArray(analysis.winningTips) ? analysis.winningTips : []).join(", ") + "\n\nInclude: Project summary, problem solved, tech stack, key features, how to run, future roadmap. Submission-ready." }]
+  });
+  const submission = (submissionRes.content[0] || {}).text || "";
+
+  const output = "PROJECT: " + analysis.projectIdea + "\nBounty: " + bounty.url + "\nGitHub: " + (repoUrl || "N/A") + "\n\n" + submission;
+  const buf = Buffer.from(output, "utf-8");
+  await agentTaskDone(taskId, "done");
+  await bot.telegram.sendDocument(chatId,
+    { source: buf, filename: "dev_submission_" + Date.now().toString().slice(-4) + ".txt" },
+    { caption: "🚀 **开发提交完成**\n\n" + (repoUrl ? "GitHub: " + repoUrl + "\n\n" : "") + "去这里提交: " + bounty.url }
+  );
+}
+
+// ── 审计类 Agent (4步) ─────────────────────────────────────────────────────────
+async function runAuditAgent(bounty, fullDesc, bot, chatId) {
+  const taskId = "audit_" + chatId + "_" + Date.now();
+  await agentTaskCreate(taskId, chatId, "audit", bounty, 5);
+  await agentLog(chatId, bot, "🤖 **审计 Agent 启动**\n📌 " + bounty.title);
+
+  // Step 1: 找目标代码库
+  await agentLog(chatId, bot, "🔍 [1/4] 寻找目标代码库...");
+  const repoSearch = await agentSearch(bounty.title + " github repository smart contract");
+  const repoRes = await anthropic.messages.create({
+    model: FAST_MODEL, max_tokens: 200,
+    messages: [{ role: "user", content: "From this bounty and search results, find the GitHub repo URL to audit:\n\nBounty: " + bounty.title + "\nBounty URL: " + bounty.url + "\nSearch: " + repoSearch + "\nBounty description: " + fullDesc.substring(0, 1000) + "\n\nReply with ONLY the GitHub URL, or 'NOT_FOUND' if cannot determine." }]
+  });
+  const repoUrl = ((repoRes.content[0] || {}).text || "").trim();
+  await agentLog(chatId, bot, "📁 目标仓库: " + (repoUrl === "NOT_FOUND" ? "未找到，基于描述分析" : repoUrl));
+
+  // Step 2: 抓取代码文件
+  await agentLog(chatId, bot, "📥 [2/4] 获取代码内容...");
+  await agentTaskStep(taskId, 2, { repoUrl });
+  let codeContent = "";
+  if (repoUrl && repoUrl !== "NOT_FOUND" && repoUrl.includes("github.com")) {
+    try {
+      const apiUrl = repoUrl.replace("github.com", "api.github.com/repos") + "/contents";
+      const filesRes = await fetch(apiUrl, { headers: { "User-Agent": "ClaudeBot", "Authorization": "token " + GITHUB_TOKEN } });
+      if (filesRes.ok) {
+        const files = await filesRes.json();
+        const codeFiles = files.filter(function(f) {
+          return [".sol", ".rs", ".js", ".ts", ".py"].some(function(ext) { return f.name.endsWith(ext); });
+        }).slice(0, 5);
+        for (const file of codeFiles) {
+          try {
+            const fr = await fetch(file.download_url);
+            const code = await fr.text();
+            codeContent += "\n\n=== " + file.name + " ===\n" + code.substring(0, 3000);
+          } catch(e) { console.error("Silent error:", e.message); }
+        }
+      }
+    } catch(e) { console.log("Repo fetch failed:", e.message); }
+  }
+  if (!codeContent) codeContent = "Code not accessible. Analyzing based on description:\n" + fullDesc.substring(0, 2000);
+
+  // Step 2.5: 如果能找到合约地址，先跑 Slither
+  let slitherFindings = "";
+  const addrInDesc = fullDesc.match(/0x[a-fA-F0-9]{40}/);
+  if (addrInDesc && SLITHER_API_URL) {
+    await agentLog(chatId, bot, "🛡 [2.5/4] Slither 静态分析...");
+    try {
+      const slitherResult = await callSlither(addrInDesc[0], "mainnet");
+      slitherFindings = "\n\n=== SLITHER 自动分析结果 ===\n" +
+        JSON.stringify(slitherResult.findings, null, 2).substring(0, 3000);
+      await agentLog(chatId, bot, "✅ Slither 完成");
+    } catch (e) { console.log("Slither skipped in audit agent:", e.message); }
+  }
+
+  // Step 3: 逐函数安全分析
+  await agentLog(chatId, bot, "🔬 [3/4] 进行安全分析...");
+  await agentTaskStep(taskId, 3, { codeSize: codeContent.length });
+  const auditRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 4096,
+    messages: [{ role: "user", content: "Perform a professional security audit for:\n\nProject: " + bounty.title + "\nRepo: " + (repoUrl || bounty.url) + "\n\nCode to audit:\n" + codeContent + "\n\nAnalyze for:\n1. Reentrancy attacks\n2. Access control issues\n3. Integer overflow/underflow\n4. Front-running vulnerabilities\n5. Logic errors\n6. Unchecked external calls\n7. Gas optimization issues\n8. Input validation\n\nFor each issue found: Severity (Critical/High/Medium/Low), Location, Description, Proof of Concept, Recommendation." }]
+  });
+  const auditFindings = (auditRes.content[0] || {}).text || "";
+
+  // Step 4: 生成专业审计报告
+  await agentLog(chatId, bot, "📋 [4/4] 生成专业审计报告...");
+  const reportRes = await anthropic.messages.create({
+    model: MAIN_MODEL, max_tokens: 3000,
+    messages: [{ role: "user", content: "Format this into a professional security audit report:\n\nProject: " + bounty.title + "\nAuditor: Claude 大神 Bot\nDate: " + new Date().toISOString().slice(0,10) + "\nFindings:\n" + auditFindings + "\n\nInclude: Executive Summary, Risk Summary Table, Detailed Findings, Recommendations, Conclusion. Professional format." }]
+  });
+  const report = (reportRes.content[0] || {}).text || "";
+
+  const fullReport = "# Security Audit Report\n## " + bounty.title + "\nAudit Date: " + new Date().toISOString().slice(0,10) + "\nBounty: " + bounty.url + "\nRepo: " + (repoUrl || "N/A") + "\n\n" + report;
+  const buf = Buffer.from(fullReport, "utf-8");
+  await agentTaskDone(taskId, "done");
+  await bot.telegram.sendDocument(chatId,
+    { source: buf, filename: "audit_" + bounty.platform + "_" + Date.now().toString().slice(-4) + ".md" },
+    { caption: "🔍 **审计报告完成**\n\n提交至: " + bounty.url + "\n\n⚠️ 请人工复核后再提交" }
+  );
+}
+
 async function executeBounty(bounty, scoring, bot, chatId) {
   try {
     // Fetch full bounty page for all types
@@ -3214,56 +4200,53 @@ async function executeBounty(bounty, scoring, bot, chatId) {
       const pageRes = await fetch(bounty.url, { headers: { "User-Agent": "Mozilla/5.0" } });
       if (pageRes.ok) {
         const html = await pageRes.text();
-        fullDesc = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 4000);
+        fullDesc = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").substring(0, 5000);
       }
     } catch(e) { console.log("Page fetch failed:", e.message); }
 
-    if (scoring.type === "content") {
-      await bot.telegram.sendMessage(chatId, "✍️ 开始生成内容类提交...");
-      const contentRes = await anthropic.messages.create({
-        model: MAIN_MODEL, max_tokens: 4096,
-        messages: [{ role: "user", content: "Write a complete submission for this bounty:\n\nBounty: " + bounty.title + "\nDeliverable: " + scoring.deliverable + "\nDetails: " + fullDesc.substring(0, 2000) + "\n\nWrite in a professional, engaging style. Make it submission-ready." }]
+    if (scoring.type === "video") {
+      await bot.telegram.sendMessage(chatId, "🎬 视频 Agent 启动，生成脚本...");
+      setImmediate(async function() {
+        try { await runVideoAgent(bounty, fullDesc, bot, chatId); }
+        catch(e) { await bot.telegram.sendMessage(chatId, "视频 Agent 失败: " + e.message).catch(function(){}); }
       });
-      const contentText = (contentRes.content[0] || {}).text || "";
-      const buf = Buffer.from("BOUNTY: " + bounty.title + "\nURL: " + bounty.url + "\n\n" + contentText, "utf-8");
-      await bot.telegram.sendDocument(chatId, { source: buf, filename: "submission_" + bounty.platform + ".txt" }, { caption: "📄 内容已生成，去这里提交: " + bounty.url });
+
+    } else if (scoring.type === "content") {
+      await bot.telegram.sendMessage(chatId, "🤖 内容 Agent 启动，开始处理...");
+      setImmediate(async function() {
+        try { await runContentAgent(bounty, fullDesc, bot, chatId); }
+        catch(e) { await bot.telegram.sendMessage(chatId, "内容 Agent 失败: " + e.message).catch(function(){}); }
+      });
 
     } else if (scoring.type === "dev" || scoring.type === "hackathon") {
       const bountyContext = "Title: " + bounty.title + "\nPlatform: " + bounty.platform + "\nPrize: " + (bounty.prize || "unknown") + "\nURL: " + bounty.url + "\nDescription: " + (bounty.description || "").substring(0, 2000) + (fullDesc ? "\n\nFull details:\n" + fullDesc.substring(0, 3000) : "");
-
-      // Pre-fill session but DON'T auto-start — wait for user confirmation
-      vibeSessions.set(chatId, {
+      await vibeSessionSave(chatId, {
         step: "confirm",
         idea: bounty.title,
         stack: "Node.js",
         details: bountyContext,
         bountyDetails: bountyContext,
-        url: bounty.url
+        url: bounty.url,
+        _agentReady: true  // flag: agent will run on confirm
       });
-
       const analyzeRes = await anthropic.messages.create({
         model: FAST_MODEL, max_tokens: 600,
-        messages: [{ role: "user", content: "Analyze this bounty and suggest the best project to build:\n\n" + bountyContext + "\n\nReply in Chinese with:\n1. 主题理解\n2. 推荐项目方向\n3. 推荐技术栈\n4. 核心功能（3-4个）\nBe concise and practical." }]
+        messages: [{ role: "user", content: "Analyze this dev bounty:\n\n" + bountyContext + "\n\nReply in Chinese: 1.主题 2.推荐项目 3.技术栈 4.核心功能(3-4个) 5.评审重点" }]
       });
       const suggestion = (analyzeRes.content[0] || {}).text || "";
       await bot.telegram.sendMessage(chatId,
-        "💻 **开发类赏金**\n\n" + suggestion +
-        "\n\n---\n✅ 发 **确认** → 自动生成项目并推送 GitHub\n❌ 发 **取消** → 忽略此赏金\n✏️ 或直接告诉我想做什么"
+        "🤖 **开发 Agent 就绪**\n\n" + suggestion +
+        "\n\n---\n✅ 发 **确认** → Agent 自动建项目+推 GitHub+生成提交说明\n❌ 发 **取消** → 忽略\n✏️ 说明想法 → 按你的方向建"
       );
 
     } else if (scoring.type === "audit") {
-      await bot.telegram.sendMessage(chatId, "🔍 开始代码审计分析...");
-      // Try to find code repo from bounty page
-      let codeUrl = bounty.url;
-      const auditRes = await anthropic.messages.create({
-        model: MAIN_MODEL,
-        max_tokens: 4096,
-        messages: [{ role: "user", content: "Write a professional security audit report outline for:\n\nProject: " + bounty.title + "\nBounty URL: " + bounty.url + "\nDescription: " + bounty.description.substring(0, 1000) + "\n\nInclude: Executive Summary, Scope, Methodology, Common Vulnerability Areas to Check (reentrancy, access control, integer overflow, etc), Risk Assessment Framework, and Reporting Template. Make it ready to use for an actual audit." }]
+      await bot.telegram.sendMessage(chatId, "🤖 审计 Agent 启动，开始处理...");
+      setImmediate(async function() {
+        try { await runAuditAgent(bounty, fullDesc, bot, chatId); }
+        catch(e) { await bot.telegram.sendMessage(chatId, "审计 Agent 失败: " + e.message).catch(function(){}); }
       });
-      const report = (auditRes.content[0] || {}).text || "";
-      const buf = Buffer.from("AUDIT REPORT: " + bounty.title + "\nSource: " + bounty.url + "\n\n" + report, "utf-8");
-      await bot.telegram.sendDocument(chatId, { source: buf, filename: "audit_" + bounty.platform + ".txt" }, { caption: "🔍 审计报告模板已生成。提交至: " + bounty.url });
     }
+
   } catch (err) {
     if (err.message && err.message.includes("429")) {
       console.log("Rate limited, retrying in 10s...");
@@ -3272,7 +4255,7 @@ async function executeBounty(bounty, scoring, bot, chatId) {
       return;
     }
     console.error("Execute bounty error:", err.message);
-    await bot.telegram.sendMessage(chatId, "执行失败: " + err.message);
+    await bot.telegram.sendMessage(chatId, "执行失败: " + err.message).catch(function(){});
   }
 }
 
@@ -3315,6 +4298,7 @@ async function runBountyPipeline(bot) {
 
     // Mark all as seen first to avoid reprocessing
     newBounties.forEach(function(b) { seenBounties.add(b.id); });
+    saveSeenBounties().catch(function(){}); // persist to survive restart
 
     // Filter by region if set
     const regionFiltered = newBounties.filter(function(b) {
